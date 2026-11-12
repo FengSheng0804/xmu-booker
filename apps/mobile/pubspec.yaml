@@ -1,0 +1,23 @@
+name: xmu_sports_booking
+description: 厦门大学体育预约独立本地客户端
+publish_to: "none"
+version: 0.2.0+14
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/third_party/

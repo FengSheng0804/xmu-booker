@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <queries><package android:name="com.tencent.mm" /></queries>
+    <application android:label="体育预约" android:usesCleartextTraffic="false"
+        tools:replace="android:label,android:usesCleartextTraffic">
+        <service android:name=".capture.CaptureKeepAliveService" android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>

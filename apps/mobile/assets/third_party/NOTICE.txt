@@ -1,0 +1,26 @@
+Capture-flavor third-party components
+Assembly: Codex, 2026-11-02, R28. Dependency binaries are unmodified.
+
+LibADB Android 3.1.1
+Copyright 2021 Muntashir Al-Islam. Apache-2.0 licensing option selected.
+Some ADB transport portions: Copyright 2013 Cameron Gutman, BSD-3-Clause.
+Source: https://github.com/MuntashirAkon/libadb-android/tree/3.1.1
+Original licensing notice and Apache/BSD texts are included in this directory.
+
+SPAKE2-Java / spake2-android 2.2.1 (LibADB dependency)
+Copyright 2021 Muntashir Al-Islam. LGPL-3.0.
+Source, including native sources and build instructions:
+https://github.com/MuntashirAkon/spake2-java/tree/2.2.1
+The library remains replaceable through the Gradle dependency in the supplied
+application source. No library implementation was modified. LGPL and GPL texts
+are included. See the upstream source for its CC0 EdDSA and other notices.
+
+Conscrypt Android 2.5.3
+Apache-2.0 and notices for its included Chromium/BoringSSL components.
+Source: https://github.com/google/conscrypt/tree/2.5.3
+Original LICENSE is included.
+
+Bouncy Castle 1.81 (bcprov, bcutil, bcpkix jdk15to18)
+Copyright The Legion of the Bouncy Castle Inc. MIT-style license.
+Source: https://github.com/bcgit/bc-java/tree/r1rv81
+Original LICENSE.html is included.
