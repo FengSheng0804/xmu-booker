@@ -16,14 +16,27 @@ internal constructor(
     private val predictor: (ByteArray) -> String = { image ->
         Captcha(context).use { it.predict(image) }
     },
+    private val testOwnerDigest: String? = null,
+    private val testPrefsName: String? = null,
 ) {
+    init {
+        check((testOwnerDigest == null && testPrefsName == null) ||
+            (com.example.xmu_sports_booking.BuildConfig.DEBUG && testOwnerDigest != null &&
+                testPrefsName?.startsWith("isolated_reconciliation_test_") == true)) { "TEST_ONLY" }
+    }
     private val dao
         get() = db.store()
 
-    private val prefs = context.getSharedPreferences("local_booking", 0)
+    private val prefs = context.getSharedPreferences(testPrefsName ?: "local_booking", 0)
     private var initialized = false
+    private var reconciliationRunning = false
+    private var lastReconciliationAttempt = 0L
+    private val reconciliationWorker by lazy {
+        java.util.concurrent.Executors.newSingleThreadExecutor()
+    }
 
     private fun ownerDigest(): String {
+        testOwnerDigest?.let { return it }
         val raw = TokenVault(context).loadSecret("sealed") ?: error("AUTH_REQUIRED")
         val f = JSONObject(raw).getJSONObject("fields")
         return SchoolSession.hex(
@@ -40,10 +53,17 @@ internal constructor(
     }
 
     val enabled
-        get() = prefs.getBoolean("real_execution", false)
+        get() = prefs.getBoolean("real_execution", true)
+    internal val isolated get() = testOwnerDigest != null
+    private fun readSession(): SchoolSession = if (isolated) sessions() else SchoolSession.openReadOnly(context)
+
+    private fun schedule() {
+        if (testOwnerDigest == null) LocalScheduler.schedule(context)
+    }
 
     companion object {
         val zone: ZoneId = ZoneId.of("Asia/Shanghai")
+        private const val MIN_CONFIRM_TO_SUBMIT_MS = 6_000L
         @Volatile private var instance: LocalEngine? = null
 
         internal fun installTestInstance(value: LocalEngine?) {
@@ -59,20 +79,51 @@ internal constructor(
 
         fun nowDate(): LocalDate = LocalDate.now(zone)
 
+        fun singlePlanFinished(plan: JSONObject, state: String): Boolean =
+            plan.optString("repeat") == "ONCE" &&
+                state in setOf("SUCCEEDED", "FAILED", "EXPIRED", "UNKNOWN", "PAYMENT_REQUIRED")
+
+        fun sameBookingScope(first: JSONObject, second: JSONObject): Boolean {
+            val venue = first.optString("venue_id")
+            if (venue.isEmpty() || venue != second.optString("venue_id")) return false
+            return listOf("stadium_id", "category_id", "owner_digest").all {
+                val a = first.optString(it)
+                val b = second.optString(it)
+                a.isEmpty() || b.isEmpty() || a == b
+            }
+        }
+
         fun executionWindow(p: JSONObject, day: LocalDate): Pair<Long, Long> {
-            val opened =
+            val run =
                 day.minusDays(p.getLong("days_before"))
-                    .atTime(LocalTime.parse(p.getString("release_time")))
-                    .atZone(zone)
-            var run =
-                opened
-                    .toLocalDate()
                     .atTime(LocalTime.parse(p.getString("execution_time")))
                     .atZone(zone)
-            val end = opened.plusSeconds(p.getLong("window_seconds"))
-            if (run < opened && end.toLocalDate() > opened.toLocalDate()) run = run.plusDays(1)
-            require(run >= opened && run < end) { "EXECUTION_WINDOW_INVALID" }
+            val seconds = p.getLong("window_seconds")
+            require(seconds in 15..3600) { "EXECUTION_WINDOW_INVALID" }
+            val end = run.plusSeconds(seconds)
             return Pair(run.toInstant().toEpochMilli(), end.toInstant().toEpochMilli())
+        }
+
+        /** Live stadiums replace their fallback mapping, whose child venue IDs can be stale. */
+        fun mergeCatalog(live: JSONArray, fallback: JSONArray): JSONArray {
+            val result = JSONArray()
+            val stadiums = mutableSetOf<String>()
+            val keys = mutableSetOf<String>()
+            fun add(row: JSONObject) {
+                val key = listOf("stadium_id", "venue_id", "category_id")
+                    .joinToString("_") { row.optString(it) }
+                if (keys.add(key)) result.put(row)
+            }
+            for (i in 0 until live.length()) {
+                val row = live.getJSONObject(i)
+                stadiums.add(row.optString("stadium_id"))
+                add(row)
+            }
+            for (i in 0 until fallback.length()) {
+                val row = fallback.getJSONObject(i)
+                if (row.optString("stadium_id") !in stadiums) add(row)
+            }
+            return result
         }
 
         fun jsonPlan(p: LocalDatabase.Plan) =
@@ -94,12 +145,18 @@ internal constructor(
     fun initialize() {
         if (initialized) return
         initialized = true
+        if (testOwnerDigest == null) LocalStorage.clean(context)
         if (!prefs.getBoolean("migrated", false)) {
             // Old project login/server data is obsolete. Keep own_sports_token and its Keystore
             // alias.
             context.getSharedPreferences("FlutterSecureStorage", 0).edit().clear().commit()
             context.getSharedPreferences("FlutterSharedPreferences", 0).edit().clear().commit()
-            prefs.edit().putBoolean("migrated", true).putBoolean("real_execution", false).commit()
+            prefs.edit().putBoolean("migrated", true).commit()
+        }
+        if (!prefs.getBoolean("automatic_execution_default", false)) {
+            val authorized = runCatching { ownerDigest() }.isSuccess
+            prefs.edit().putBoolean("automatic_execution_default", true)
+                .putBoolean("real_execution", authorized).commit()
         }
         dao.recover(System.currentTimeMillis())
         generate()
@@ -120,17 +177,28 @@ internal constructor(
                 dao.clearCache()
             }
         }
-        if (owner != null) prefs.edit().putString("active_owner", owner).commit()
+        if (owner != null) prefs.edit().putString("active_owner", owner)
+            .putBoolean("real_execution", true).commit()
         generate()
-        LocalScheduler.schedule(context)
+        schedule()
         val metadata =
             runCatching { TokenVault(context).metadata() }
                 .getOrElse { JSONObject().put("has_token", false) }
         return JSONObject()
             .put("authorization", metadata)
             .put("execution_enabled", enabled)
-            .put("plans", JSONArray(dao.plans().map { jsonPlan(it) }))
-            .put("tasks", JSONArray(dao.tasks().map { jsonTask(it) }))
+            .put("plans", JSONArray(dao.plans().map {
+                jsonPlan(it).also { output ->
+                    dao.latestResult(it.id)?.let { task -> output.put("last_result", jsonTask(task)) }
+                }
+            }))
+            .put("tasks", JSONArray(visibleExecutionTasks().map { task ->
+                jsonTask(task).also { output ->
+                    if (task.reason.contains("PENDING_RECONCILIATION")) {
+                        output.put("blocking_tasks", JSONArray(blockingTasks(task).map { jsonTask(it) }))
+                    }
+                }
+            }))
             .put(
                 "messages",
                 JSONArray(
@@ -143,10 +211,67 @@ internal constructor(
                 ),
             )
             .put("orders", JSONArray(dao.cached("orders")?.json ?: "[]"))
-            .put("venues", JSONArray(dao.cached("venues")?.json ?: "[]"))
+            .put(
+                "venues",
+                dao.cached("venues")?.json?.let { cached ->
+                    if (cached.isBlank() || cached == "[]") defaultVenuesArray() else JSONArray(cached)
+                } ?: defaultVenuesArray()
+            )
             .put("orders_updated_at", dao.cached("orders")?.updatedAt ?: 0)
             .put("venues_updated_at", dao.cached("venues")?.updatedAt ?: 0)
             .put("permissions", LocalScheduler.permissions(context))
+    }
+
+    private fun defaultCategory(name: String): String = when {
+        name.contains("健身") -> "8"
+        name.contains("羽毛球") -> "3"
+        name.contains("乒乓球") -> "2"
+        name.contains("网球") -> "9"
+        name.contains("游泳") || name.contains("泳池") -> "6"
+        name.contains("单车") -> "7"
+        name.contains("瑜伽") -> "11"
+        name.contains("匹克球") -> "12"
+        name.contains("篮球") -> "1"
+        name.contains("排球") -> "5"
+        name.contains("足球") -> "4"
+        else -> "1"
+    }
+
+    private fun defaultProjectName(name: String): String = when {
+        name.contains("健身") -> "健身房"
+        name.contains("羽毛球") -> "羽毛球"
+        name.contains("乒乓球") -> "乒乓球"
+        name.contains("网球") -> "网球"
+        name.contains("游泳") || name.contains("泳池") -> "游泳"
+        name.contains("单车") -> "动感单车"
+        name.contains("瑜伽") -> "瑜伽"
+        name.contains("匹克球") -> "匹克球"
+        name.contains("风雨球馆") -> "风雨球馆"
+        else -> name
+    }
+
+    private fun knownVenues(): List<JSONObject> = listOf(
+        JSONObject().put("stadium_id", "6").put("venue_id", "6").put("category_id", "8").put("stadium_name", "思明校区健身房").put("project_name", "健身房"),
+        JSONObject().put("stadium_id", "16").put("venue_id", "14").put("category_id", "8").put("stadium_name", "翔安校区健身房").put("project_name", "健身房"),
+        JSONObject().put("stadium_id", "9").put("venue_id", "9").put("category_id", "3").put("stadium_name", "思明校区风雨球馆").put("project_name", "风雨球馆"),
+        JSONObject().put("stadium_id", "4").put("venue_id", "4").put("category_id", "6").put("stadium_name", "王清明游泳馆一楼泳池").put("project_name", "游泳"),
+        JSONObject().put("stadium_id", "5").put("venue_id", "5").put("category_id", "6").put("stadium_name", "王清明游泳馆顶楼泳池").put("project_name", "游泳"),
+        JSONObject().put("stadium_id", "8").put("venue_id", "8").put("category_id", "9").put("stadium_name", "思明校区东苑网球场").put("project_name", "网球"),
+        JSONObject().put("stadium_id", "2").put("venue_id", "2").put("category_id", "7").put("stadium_name", "动感单车室（动感单车朋辈课堂）").put("project_name", "动感单车"),
+        JSONObject().put("stadium_id", "17").put("venue_id", "17").put("category_id", "12").put("stadium_name", "演武室外匹克球场").put("project_name", "匹克球"),
+        JSONObject().put("stadium_id", "11").put("venue_id", "11").put("category_id", "11").put("stadium_name", "B馆教室（瑜伽朋辈课堂）").put("project_name", "瑜伽"),
+        JSONObject().put("stadium_id", "12").put("venue_id", "12").put("category_id", "6").put("stadium_name", "翔安校区游泳馆").put("project_name", "游泳"),
+        JSONObject().put("stadium_id", "13").put("venue_id", "13").put("category_id", "3").put("stadium_name", "翔安校区羽毛球场").put("project_name", "羽毛球"),
+        JSONObject().put("stadium_id", "15").put("venue_id", "15").put("category_id", "2").put("stadium_name", "翔安校区乒乓球室").put("project_name", "乒乓球"),
+        JSONObject().put("stadium_id", "14").put("venue_id", "14").put("category_id", "9").put("stadium_name", "翔安校区一期网球场").put("project_name", "网球")
+    )
+
+    private fun defaultVenuesArray(): JSONArray {
+        val arr = JSONArray()
+        for (v in knownVenues()) {
+            arr.put(JSONObject(v.toString()))
+        }
+        return arr
     }
 
     @Synchronized
@@ -154,7 +279,7 @@ internal constructor(
         if (value) check(TokenVault(context).metadata().optBoolean("has_token")) { "AUTH_REQUIRED" }
         check(prefs.edit().putBoolean("real_execution", value).commit())
         generate()
-        LocalScheduler.schedule(context)
+        schedule()
     }
 
     private fun cache(key: String, value: JSONArray) {
@@ -178,36 +303,185 @@ internal constructor(
     fun syncOrders(): JSONArray {
         val owner = ownerDigest()
         val epoch = epoch()
-        return sessions().use { session ->
-            session.orders(true).also { cacheCurrent("orders", it, owner, epoch) }
+        val reconcile = dao.pendingReconciliation().isNotEmpty()
+        return readSession().use { session ->
+            session.orders(reconcile).also {
+                cacheCurrent("orders", it, owner, epoch)
+                if (reconcile) reconcileOrders(session, it, owner, epoch)
+            }
+        }
+    }
+
+    @Synchronized
+    internal fun visibleExecutionTasks(): List<LocalDatabase.Task> {
+        val hidden = (prefs.getStringSet("hidden_execution_records", emptySet()) ?: emptySet()).toMutableSet()
+        val tasks = dao.tasks()
+        // A paused, unsent task may be explicitly enabled again with the same durable ID.
+        val reopened = tasks.filter { it.id in hidden && it.state in setOf("PENDING", "CLAIMED", "SENT") }
+        if (reopened.isNotEmpty()) {
+            hidden.removeAll(reopened.map { it.id }.toSet())
+            check(prefs.edit().putStringSet("hidden_execution_records", hidden).commit())
+        }
+        return tasks.filter { it.id !in hidden }
+    }
+
+    @Synchronized
+    fun deleteExecutionRecord(id: String) {
+        val task = dao.task(id) ?: error("INVALID_TASK")
+        check(task.state !in setOf("PENDING", "CLAIMED", "SENT")) { "TASK_IN_PROGRESS" }
+        val hidden = (prefs.getStringSet("hidden_execution_records", emptySet()) ?: emptySet()).toMutableSet()
+        hidden.add(id)
+        check(prefs.edit().putStringSet("hidden_execution_records", hidden).commit())
+        // Keep the durable execution receipt for duplicate prevention and unresolved-order checks.
+    }
+
+    fun entryPass(id: String): JSONObject {
+        val task = synchronized(this) { dao.task(id) ?: error("INVALID_TASK") }
+        check(task.state == "SUCCEEDED") { "ENTRY_PASS_UNAVAILABLE" }
+        val target = JSONObject(task.target)
+        check(ownerDigest() == target.optString("owner_digest")) { "OWNER_MISMATCH" }
+        val currentEpoch = epoch()
+        val result = sessions().use { it.entryPass(target, JSONObject(task.receipt)) }
+        check(epoch() == currentEpoch && ownerDigest() == target.optString("owner_digest")) { "AUTHORIZATION_CHANGED" }
+        return result
+    }
+
+    fun orderEntryPass(id: String): JSONObject {
+        val owner = ownerDigest()
+        val currentEpoch = epoch()
+        val result = readSession().use { it.orderEntryPass(id) }
+        check(epoch() == currentEpoch && ownerDigest() == owner) { "AUTHORIZATION_CHANGED" }
+        return result
+    }
+
+    /** Called on UI refresh; a single background read at most every 30 seconds, never a submit. */
+    @Synchronized
+    fun requestReconciliation() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (reconciliationRunning ||
+            (lastReconciliationAttempt != 0L && now - lastReconciliationAttempt < 30_000L) ||
+            dao.pendingReconciliation().isEmpty()) return
+        reconciliationRunning = true
+        lastReconciliationAttempt = now
+        reconciliationWorker.execute {
+            try { reconcilePending() } catch (_: Exception) {
+                // Keep unresolved states intact; later refresh or updated authorization retries reads.
+            } finally { synchronized(this) { reconciliationRunning = false } }
+        }
+    }
+
+    fun reconcilePending() {
+        if (dao.pendingReconciliation().isEmpty()) return
+        val owner = ownerDigest()
+        val currentEpoch = epoch()
+        sessions().use { school ->
+            val orders = school.orders(true)
+            cacheCurrent("orders", orders, owner, currentEpoch)
+            reconcileOrders(school, orders, owner, currentEpoch)
+        }
+    }
+
+    private fun reconcileOrders(school: SchoolSession, orders: JSONArray, owner: String, currentEpoch: Long) {
+        for (task in dao.pendingReconciliation()) {
+            if (JSONObject(task.target).optString("owner_digest") == owner)
+                applyLookup(task, school, orders, owner, currentEpoch, false)
         }
     }
 
     fun syncCatalog(): JSONArray {
         val owner = ownerDigest()
         val epoch = epoch()
-        return sessions().use { session ->
-            session.initializeHome() // Home initialization has no assumed stadium-list wire shape.
-            val result = JSONArray()
-            for ((stadium, venue, name) in
-                listOf(Triple("16", "14", "翔安校区健身房"), Triple("6", "6", "思明校区健身房"))) {
-                val target =
+        return readSession().use { session ->
+            val stadiumsData = try {
+                session.stadiumList()
+            } catch (e: Exception) {
+                null
+            }
+            val stadiumList = stadiumsData?.optJSONArray("stadium")
+            val targets = mutableListOf<JSONObject>()
+            val seenKeys = mutableSetOf<String>()
+
+            fun addTarget(stadiumId: String, venueId: String, categoryId: String, stadiumName: String, projectName: String) {
+                val key = "${stadiumId}_${venueId}_${categoryId}"
+                if (!seenKeys.add(key)) return
+                targets.add(
                     JSONObject()
-                        .put("stadium_id", stadium)
-                        .put("venue_id", venue)
-                        .put("category_id", "8")
-                        .put("stadium_name", name)
-                        .put("project_name", "健身房")
+                        .put("stadium_id", stadiumId)
+                        .put("venue_id", venueId)
+                        .put("category_id", categoryId)
+                        .put("stadium_name", stadiumName)
+                        .put("project_name", projectName)
                         .put("date", nowDate().toString())
-                val inventory = session.inventory(target)
-                result.put(JSONObject(target.toString()).put("inventory", inventory))
+                )
+            }
+
+            fun addFallback(stadiumId: String, stadiumName: String) {
+                val known = knownVenues().firstOrNull { it.getString("stadium_id") == stadiumId }
+                addTarget(stadiumId, known?.getString("venue_id") ?: stadiumId,
+                    known?.getString("category_id") ?: defaultCategory(stadiumName),
+                    stadiumName, known?.getString("project_name") ?: defaultProjectName(stadiumName))
+            }
+
+            if (stadiumList != null && stadiumList.length() > 0) {
+                for (i in 0 until stadiumList.length()) {
+                    val st = stadiumList.getJSONObject(i)
+                    val sId = st.optString("id")
+                    val sName = st.optString("name")
+                    try {
+                        val details = session.stadiumDetails(sId)
+                        val venues = details.optJSONArray("venue")
+                        if (venues != null && venues.length() > 0) {
+                            for (j in 0 until venues.length()) {
+                                val v = venues.getJSONObject(j)
+                                val pName = v.optString("name").ifBlank { defaultProjectName(sName) }
+                                val cId = v.optString("category_id").ifBlank { defaultCategory(sName) }
+                                val list = v.optJSONArray("list")
+                                if (list != null && list.length() > 0) {
+                                    val vIds = mutableSetOf<String>()
+                                    for (k in 0 until list.length()) {
+                                        val vid = list.getJSONObject(k).optString("venue_id")
+                                        if (vid.isNotBlank()) vIds.add(vid)
+                                    }
+                                    if (vIds.isEmpty()) vIds.add(sId)
+                                    for (vid in vIds) {
+                                        addTarget(sId, vid, cId, sName, pName)
+                                    }
+                                } else {
+                                    addTarget(sId, sId, cId, sName, pName)
+                                }
+                            }
+                        } else {
+                            addFallback(sId, sName)
+                        }
+                    } catch (e: Exception) {
+                        addFallback(sId, sName)
+                    }
+                }
+            }
+
+            val result = JSONArray()
+            val merged = mergeCatalog(JSONArray(targets), defaultVenuesArray())
+            for (i in 0 until merged.length()) {
+                val target = merged.getJSONObject(i)
+                val inventory = try {
+                    session.inventoryForQuery(target)
+                } catch (e: Exception) {
+                    JSONObject()
+                        .put("is_can_choose", 0)
+                        .put("is_can_choose_tips", "暂不支持预约或未开放")
+                        .put("time_slot_list", JSONArray())
+                }
+                val resolved = inventory.optJSONObject("resolved_target") ?: target
+                result.put(JSONObject(resolved.toString()).put("inventory", inventory))
             }
             cacheCurrent("venues", result, owner, epoch)
             result
         }
     }
 
-    fun availability(target: JSONObject): JSONObject = sessions().use { it.inventory(target) }
+    fun availability(target: JSONObject): JSONObject = readSession().use { session ->
+        session.inventoryForQuery(target)
+    }
 
     fun validate(plan: JSONObject) {
         require(plan.getString("name").length in 1..80) { "INVALID_PLAN" }
@@ -236,7 +510,7 @@ internal constructor(
         weekly.keys().forEach { day ->
             require(day.toInt() in 1..7) { "INVALID_PLAN" }
             val ranges = weekly.getJSONArray(day)
-            require(ranges.length() in 1..3) { "INVALID_PLAN" }
+            require(ranges.length() >= 1) { "INVALID_PLAN" }
             val unique = mutableSetOf<String>()
             for (i in 0 until ranges.length()) {
                 val range = ranges.getString(i)
@@ -266,14 +540,26 @@ internal constructor(
 
     @Synchronized
     fun savePlan(plan: JSONObject): String {
+        if (!plan.has("enabled")) plan.put("enabled", true)
         validate(plan)
-        val id = plan.optString("id").ifEmpty { UUID.randomUUID().toString() }
-        UUID.fromString(id)
+        val sourceId = plan.optString("id").ifEmpty { UUID.randomUUID().toString() }
+        UUID.fromString(sourceId)
+        val latest = dao.latestResult(sourceId)
+        val reset = plan.optBoolean("reset_execution") && dao.plan(sourceId) != null && latest != null &&
+            latest.state in setOf("SUCCEEDED", "FAILED", "EXPIRED", "UNKNOWN", "PAYMENT_REQUIRED", "CANCELLED")
+        if (reset) check(dao.inFlightForPlan(sourceId) == 0) {
+            "TASK_IN_PROGRESS"
+        }
+        val id = if (reset) UUID.randomUUID().toString() else sourceId
+        val existing = dao.taskForDate(id, plan.optString("date"))
+        require(!plan.optBoolean("enabled") || existing == null ||
+            !singlePlanFinished(plan, existing.state)) { "SINGLE_PLAN_FINISHED" }
         val saved =
             LocalDatabase.Plan().apply {
                 this.id = id
                 json =
                     JSONObject(plan.toString())
+                        .also { it.remove("last_result"); it.remove("reset_execution") }
                         .put("id", id)
                         .put("owner_digest", ownerDigest())
                         .toString()
@@ -281,11 +567,12 @@ internal constructor(
                 updatedAt = System.currentTimeMillis()
             }
         db.runInTransaction {
-            dao.cancelPending(id, System.currentTimeMillis())
+            dao.cancelPending(sourceId, System.currentTimeMillis())
             dao.savePlan(saved)
+            if (reset) dao.deletePlan(sourceId)
         }
         generate()
-        LocalScheduler.schedule(context)
+        schedule()
         return id
     }
 
@@ -295,11 +582,18 @@ internal constructor(
             dao.cancelPending(id, System.currentTimeMillis())
             dao.deletePlan(id)
         }
-        LocalScheduler.schedule(context)
+        schedule()
     }
 
     @Synchronized
     fun generate() {
+        // Repair enabled flags of completed single plans created by older versions as well.
+        for (plan in dao.plans().filter { it.enabled }) {
+            val p = JSONObject(plan.json)
+            if (p.optString("repeat") == "ONCE") {
+                dao.taskForDate(plan.id, p.optString("date"))?.let { retireSingle(plan, it) }
+            }
+        }
         for (plan in dao.plans().filter { it.enabled }) {
             val p = JSONObject(plan.json)
             val weekly = p.getJSONObject("weekdays")
@@ -349,7 +643,7 @@ internal constructor(
                 createdAt = System.currentTimeMillis()
             }
         )
-        LocalScheduler.notifyResult(context, text, task.id.hashCode())
+        if (testOwnerDigest == null) LocalScheduler.notifyResult(context, text, task.id.hashCode())
     }
 
     private fun finish(
@@ -358,11 +652,24 @@ internal constructor(
         reason: String,
         receipt: JSONObject = JSONObject(task.receipt),
     ) {
-        if (dao.task(task.id) == null) return
-        dao.finish(task.id, state, receipt.toString(), reason, System.currentTimeMillis())
+        val previous = dao.task(task.id) ?: return
         task.state = state
         task.receipt = receipt.toString()
-        message(task, reason)
+        db.runInTransaction {
+            dao.finish(task.id, state, receipt.toString(), reason, System.currentTimeMillis())
+            dao.plan(task.planId)?.let { retireSingle(it, task) }
+        }
+        if (previous.state != state || previous.reason != reason) message(task, reason)
+    }
+
+    private fun retireSingle(plan: LocalDatabase.Plan, task: LocalDatabase.Task) {
+        val p = JSONObject(plan.json)
+        if (plan.enabled && p.optString("date") == task.date && singlePlanFinished(p, task.state)) {
+            plan.enabled = false
+            plan.json = p.put("enabled", false).toString()
+            plan.updatedAt = System.currentTimeMillis()
+            dao.savePlan(plan)
+        }
     }
 
     private fun stillAllowed(task: LocalDatabase.Task) {
@@ -376,13 +683,19 @@ internal constructor(
         }
     }
 
+    private fun blockingTasks(task: LocalDatabase.Task): List<LocalDatabase.Task> =
+        dao.unresolved(task.date).filter {
+            it.id != task.id && sameBookingScope(JSONObject(it.target), JSONObject(task.target))
+        }
+
     /** Run on one worker thread. Waiting does not hold the mutation lock so the user can pause. */
     fun execute(id: String) {
         val task = synchronized(this) { dao.task(id) ?: return }
-        if (task.state in setOf("SENT", "UNKNOWN", "CLAIMED")) {
+        if (task.state == "UNKNOWN") {
             reconcile(task)
             return
         }
+        if (task.state != "PENDING") return
         val claim = JSONObject().put("claim", UUID.randomUUID().toString()).toString()
         synchronized(this) {
             if (!enabled) return
@@ -402,11 +715,7 @@ internal constructor(
                 val baseline = school.orders(true)
                 // Unknown same-venue/day receipts are a barrier even for a newly copied plan.
                 check(
-                    dao.unresolved(task.date).none {
-                        it.id != id &&
-                            JSONObject(it.target).optString("venue_id") ==
-                                target.getString("venue_id")
-                    }
+                    blockingTasks(task).isEmpty()
                 ) {
                     "PENDING_RECONCILIATION"
                 }
@@ -417,8 +726,9 @@ internal constructor(
                         synchronized(this) {
                             finish(
                                 task,
-                                "SUCCEEDED",
-                                "学校已有对应预约",
+                                if (SchoolSession.needsPayment(matches.getJSONObject(0))) "PAYMENT_REQUIRED" else "SUCCEEDED",
+                                if (SchoolSession.needsPayment(matches.getJSONObject(0)))
+                                    "学校已有对应订单，待支付；请到学校入口处理" else "学校已有对应预约",
                                 JSONObject().put("order", matches.getJSONObject(0)),
                             )
                         }
@@ -444,8 +754,21 @@ internal constructor(
                 }
                 check(detail != null) { "NO_AVAILABLE_TARGET" }
                 val selected = detail
+                val prepareStarted = System.currentTimeMillis()
                 val image = school.prepare(target, selected)
                 val prediction = predictor(image)
+                // Official manual bookings took 5.7-7.1 s between the confirm page and addOrder;
+                // every machine-speed submit was refused. Keep a human-scale gap before sending.
+                while (System.currentTimeMillis() - prepareStarted < MIN_CONFIRM_TO_SUBMIT_MS) {
+                    stillAllowed(task)
+                    Thread.sleep(
+                        minOf(
+                            250L,
+                            MIN_CONFIRM_TO_SUBMIT_MS - (System.currentTimeMillis() - prepareStarted),
+                        ).coerceAtLeast(1)
+                    )
+                }
+                stillAllowed(task)
                 val receipt =
                     JSONObject()
                         .put("detail", selected)
@@ -482,8 +805,11 @@ internal constructor(
             synchronized(this) {
                 val current = dao.task(id) ?: return
                 if (!sent && (current.state != "CLAIMED" || current.receipt != claim)) return
+                val rejection = (e as? SchoolSession.RejectedException)?.description()
+                    ?: (e as? com.example.xmu_sports_booking.capture.SportsProtocol.ReadRejectedException)?.description()
                 if (sent) {
-                    finish(task, "UNKNOWN", "提交结果待核对，禁止自动重发")
+                    finish(task, "UNKNOWN", "提交结果待核对，禁止自动重发" +
+                        (rejection?.let { "。$it" } ?: ""))
                 } else {
                     val code =
                         e.message?.takeIf { it.matches(Regex("[A-Z_]{3,64}")) }
@@ -492,57 +818,88 @@ internal constructor(
                     finish(
                         task,
                         if (stopped) "CANCELLED" else "FAILED",
-                        if (stopped) "计划已暂停" else "预约未完成：$code",
+                        if (stopped) "计划已暂停" else "预约未完成：${rejection ?: code}",
                     )
                 }
             }
+            if (sent) reconcile(task)
+        }
+    }
+
+    fun inspectTask(id: String): JSONObject = lookupTask(id, false, false)
+
+    fun releaseTask(id: String, confirmedNoOrder: Boolean): JSONObject {
+        require(confirmedNoOrder) { "RECONCILIATION_CONFIRMATION_REQUIRED" }
+        val task = synchronized(this) { dao.task(id) ?: error("INVALID_TASK") }
+        require(JSONObject(task.receipt).optJSONObject("last_lookup")?.optString("result") == "NO_MATCH") {
+            "RECONCILIATION_CHECK_REQUIRED"
+        }
+        // Read school orders again; a newly visible order must win over the earlier empty result.
+        return lookupTask(id, true, false)
+    }
+
+    private fun lookupTask(id: String, confirmedNoOrder: Boolean, allowSent: Boolean): JSONObject {
+        val task = synchronized(this) { dao.task(id) ?: error("INVALID_TASK") }
+        check(task.state == "UNKNOWN" || (allowSent && task.state == "SENT")) { "TASK_IN_PROGRESS" }
+        val target = JSONObject(task.target)
+        val owner = ownerDigest()
+        val currentEpoch = epoch()
+        check(owner == target.getString("owner_digest")) { "OWNER_MISMATCH" }
+        return sessions().use { school ->
+            val orders = school.orders(true)
+            cacheCurrent("orders", orders, owner, currentEpoch)
+            applyLookup(task, school, orders, owner, currentEpoch, confirmedNoOrder)
+        }
+    }
+
+    private fun applyLookup(task: LocalDatabase.Task, school: SchoolSession, orders: JSONArray,
+        owner: String, currentEpoch: Long, confirmedNoOrder: Boolean): JSONObject {
+        val matches = school.matchesTask(orders, JSONObject(task.target), JSONObject(task.receipt))
+        return synchronized(this) {
+                check(epoch() == currentEpoch && ownerDigest() == owner) { "AUTHORIZATION_CHANGED" }
+                val current = dao.task(task.id) ?: error("INVALID_TASK")
+                if (current.state != task.state || current.receipt != task.receipt) {
+                    return@synchronized jsonTask(current).put("can_release", false)
+                }
+                val receipt = JSONObject(current.receipt)
+                val checkedAt = System.currentTimeMillis()
+                receipt.put("last_lookup", JSONObject().put("checked_at", checkedAt)
+                    .put("result", if (matches.length() == 0) "NO_MATCH" else "MATCHED"))
+                when {
+                    matches.length() == 1 -> {
+                        val order = matches.getJSONObject(0)
+                        val payment = SchoolSession.needsPayment(order)
+                        finish(current, if (payment) "PAYMENT_REQUIRED" else "SUCCEEDED",
+                            if (payment) "查单确认学校已有对应订单，待支付；请到学校入口处理"
+                            else "预约成功，已核对学校订单", receipt.put("order", order))
+                    }
+                    matches.length() > 1 -> finish(current, "UNKNOWN",
+                        "学校有多条对应订单，请到学校入口核对；保留阻塞，不会重新提交", receipt)
+                    confirmedNoOrder -> finish(current, "FAILED",
+                        "已查单且用户确认学校无对应订单，旧任务阻塞已解除；未重新提交",
+                        receipt.put("manual_resolution", JSONObject().put("confirmed_no_order_at", checkedAt)))
+                    else -> finish(current, "UNKNOWN",
+                        "已完整读取学校订单，未找到对应预约；请核对学校原入口后确认解除阻塞，不会自动重发", receipt)
+                }
+                jsonTask(dao.task(task.id)).put("can_release", matches.length() == 0 && !confirmedNoOrder)
         }
     }
 
     fun reconcile(task: LocalDatabase.Task) {
         try {
-            check(ownerDigest() == JSONObject(task.target).getString("owner_digest")) {
-                "OWNER_MISMATCH"
-            }
-            sessions().use { school ->
-                val currentEpoch = epoch()
-                val orders = school.orders(true)
-                cacheCurrent(
-                    "orders",
-                    orders,
-                    JSONObject(task.target).getString("owner_digest"),
-                    currentEpoch,
-                )
-                val target = JSONObject(task.target)
-                val receipt = JSONObject(task.receipt)
-                if (!receipt.has("range")) {
-                    synchronized(this) { finish(task, "UNKNOWN", "执行曾中断，请核对学校订单；不会重新提交") }
-                    return
-                }
-                val matches =
-                    school.matches(
-                        orders,
-                        target,
-                        receipt.getString("range"),
-                        receipt.getJSONObject("detail").getString("area_id"),
-                    )
-                val baseline = receipt.getJSONArray("baseline")
-                val old = (0 until baseline.length()).map { baseline.getString(it) }.toSet()
-                if (
-                    matches.length() == 1 && matches.getJSONObject(0).getString("order_id") !in old
-                ) {
-                    synchronized(this) {
-                        finish(
-                            task,
-                            "SUCCEEDED",
-                            "预约成功，学校订单已确认",
-                            receipt.put("order", matches.getJSONObject(0)),
-                        )
-                    }
-                } else synchronized(this) { finish(task, "UNKNOWN", "未取得唯一学校订单，保留查单状态；不会重新提交") }
+            for (attempt in 0..2) {
+                if (attempt > 0) Thread.sleep(if (attempt == 1) 1500L else 3000L)
+                val current = synchronized(this) { dao.task(task.id) } ?: return
+                if (current.state !in setOf("SENT", "UNKNOWN")) return
+                val result = lookupTask(task.id, false, true)
+                if (result.getString("state") != "UNKNOWN") return
             }
         } catch (_: Exception) {
-            synchronized(this) { finish(task, "UNKNOWN", "查单未完成，请联网或更新授权后重试；不会重新提交") }
+            synchronized(this) {
+                val current = dao.task(task.id) ?: return
+                if (current.state in setOf("SENT", "UNKNOWN"))
+                    finish(current, "UNKNOWN", "查单未完成，请联网或更新授权后重试；不会重新提交")
+            }
         }
     }
 
@@ -555,6 +912,7 @@ internal constructor(
             dao.clearCache()
             dao.clearMessages()
         }
+        prefs.edit().remove("hidden_execution_records").commit()
     }
 
     @Synchronized

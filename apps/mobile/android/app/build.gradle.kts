@@ -107,6 +107,12 @@ android {
 
     buildTypes {
         debug { applicationIdSuffix = ".debug" }
+        // AOT compilation without changing the installed identity or losing saved authorization.
+        getByName("profile") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".debug"
+            matchingFallbacks += listOf("debug")
+        }
         release {
             // Signing is selected explicitly by flavor; no production debug fallback.
             isMinifyEnabled = true

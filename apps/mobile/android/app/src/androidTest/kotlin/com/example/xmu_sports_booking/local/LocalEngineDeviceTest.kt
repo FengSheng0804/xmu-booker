@@ -327,6 +327,36 @@ class LocalEngineDeviceTest {
     }
 
     @Test
+    fun failedSinglePlanIsDisabledTogetherWithTaskResult() {
+        val task = seed()
+        val plan = db.store().plan(task.planId)
+        plan.json = JSONObject(plan.json).put("date", task.date).toString()
+        db.store().savePlan(plan)
+        val wire = Wire()
+        val engine = LocalEngine(context, db, { SchoolSession(record, wire) },
+            { error("MODEL_RUNTIME_UNAVAILABLE") })
+        engine.setExecution(true)
+        engine.execute(task.id)
+        assertEquals("FAILED", db.store().task(task.id).state)
+        assertFalse(db.store().plan(plan.id).enabled)
+        assertEquals(0, wire.submits)
+    }
+
+    @Test
+    fun legacyFailedSinglePlanIsRetiredWithoutNetworkOrResubmission() {
+        val task = seed()
+        val plan = db.store().plan(task.planId)
+        plan.json = JSONObject(plan.json).put("date", task.date).toString()
+        db.store().savePlan(plan)
+        db.store().finish(task.id, "FAILED", "{}", "预约未完成：SCHOOL_REJECTED", 1)
+        val engine = LocalEngine(context, db, { error("NETWORK_MUST_NOT_BE_CALLED") }, { "AB12" })
+        engine.generate()
+        assertFalse(db.store().plan(plan.id).enabled)
+        assertEquals("FAILED", db.store().task(task.id).state)
+        assertEquals("FAILED", db.store().latestResult(plan.id).state)
+    }
+
+    @Test
     fun concurrentClaimsAndStaleClaimCannotSend() {
         val t = seed()
         val ready = CountDownLatch(1)

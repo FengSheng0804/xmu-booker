@@ -95,11 +95,23 @@ public abstract class LocalDatabase extends RoomDatabase {
     @Query("SELECT * FROM tasks WHERE date=:date AND state IN ('SENT','UNKNOWN','CLAIMED')")
     List<Task> unresolved(String date);
 
+    @Query("SELECT * FROM tasks WHERE state IN ('SENT','UNKNOWN') ORDER BY runAt DESC")
+    List<Task> pendingReconciliation();
+
+    @Query("SELECT COUNT(*) FROM tasks WHERE planId=:planId AND state IN ('CLAIMED','SENT')")
+    int inFlightForPlan(String planId);
+
     @Query("SELECT * FROM tasks WHERE state='PENDING' AND prepareAt<=:now")
     List<Task> due(long now);
 
     @Query("SELECT * FROM tasks WHERE id=:id")
     Task task(String id);
+
+    @Query("SELECT * FROM tasks WHERE planId=:planId AND date=:date LIMIT 1")
+    Task taskForDate(String planId, String date);
+
+    @Query("SELECT * FROM tasks WHERE planId=:planId AND state NOT IN ('PENDING','CLAIMED','CANCELLED') ORDER BY updatedAt DESC LIMIT 1")
+    Task latestResult(String planId);
 
     @Query("SELECT * FROM tasks WHERE state='PENDING' ORDER BY prepareAt LIMIT 1")
     Task next();

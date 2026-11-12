@@ -17,6 +17,7 @@ import org.json.JSONObject
 class LocalBridge(private val activity: FlutterActivity, private val channel: MethodChannel) :
     AutoCloseable {
     private val worker = Executors.newSingleThreadExecutor()
+    private val reads = Executors.newFixedThreadPool(2)
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var closed = false
 
@@ -47,13 +48,13 @@ class LocalBridge(private val activity: FlutterActivity, private val channel: Me
                     result.success(null)
                 }
                 else ->
-                    worker.execute {
+                    (if (call.method in setOf("syncOrders", "syncCatalog", "availability", "orderEntryPass")) reads else worker).execute {
                         try {
                             val engine = LocalEngine.get(activity)
                             engine.initialize()
                             val output: Any? =
                                 when (call.method) {
-                                    "home" -> engine.home()
+                                    "home" -> engine.home().also { engine.requestReconciliation() }
                                     "syncOrders" -> engine.syncOrders()
                                     "syncCatalog" -> engine.syncCatalog()
                                     "availability" ->
@@ -68,6 +69,13 @@ class LocalBridge(private val activity: FlutterActivity, private val channel: Me
                                         engine.deletePlan(call.argument<String>("id") ?: "")
                                         null
                                     }
+                                    "deleteExecutionRecord" -> {
+                                        engine.deleteExecutionRecord(call.argument<String>("id") ?: "")
+                                        null
+                                    }
+                                    "entryPass" -> engine.entryPass(call.argument<String>("id") ?: "")
+                                    "orderEntryPass" -> engine.orderEntryPass(call.argument<String>("id") ?: "")
+                                    "cleanStorage" -> LocalStorage.clean(activity)
                                     "setExecution" -> {
                                         engine.setExecution(
                                             call.argument<Boolean>("enabled") == true
@@ -88,6 +96,9 @@ class LocalBridge(private val activity: FlutterActivity, private val channel: Me
                                         LocalScheduler.start(activity, id)
                                         null
                                     }
+                                    "inspectTask" -> engine.inspectTask(call.argument<String>("id") ?: "")
+                                    "releaseTask" -> engine.releaseTask(call.argument<String>("id") ?: "",
+                                        call.argument<Boolean>("confirmed_no_order") == true)
                                     "clear" -> {
                                         engine.clear()
                                         null
@@ -118,7 +129,10 @@ class LocalBridge(private val activity: FlutterActivity, private val channel: Me
                                 "operation=${call.method},type=${error.javaClass.simpleName},site=${site?.methodName}:${site?.lineNumber}",
                             )
                             if (!closed)
-                                main.post { if (!closed) result.error(code, "操作未完成：$code", null) }
+                                main.post { if (!closed) result.error(code,
+                                    (error as? SchoolSession.RejectedException)?.description()
+                                        ?: (error as? com.example.xmu_sports_booking.capture.SportsProtocol.ReadRejectedException)?.description()
+                                        ?: "操作未完成：$code", null) }
                         }
                     }
             }
@@ -129,5 +143,6 @@ class LocalBridge(private val activity: FlutterActivity, private val channel: Me
         closed = true
         channel.setMethodCallHandler(null)
         worker.shutdownNow()
+        reads.shutdownNow()
     }
 }

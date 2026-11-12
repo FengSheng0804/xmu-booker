@@ -25,6 +25,7 @@ object LocalScheduler {
         JSONObject()
             .put("notifications", notifications(context))
             .put("exact_alarm", exact(context))
+            .put("keep_alive_active", LocalKeepAliveService.active)
             .put(
                 "battery_unrestricted",
                 context
@@ -48,7 +49,7 @@ object LocalScheduler {
             )
         return Notification.Builder(context, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_menu_today)
-            .setContentTitle("厦大体育预约")
+            .setContentTitle("场馆预约助手")
             .setContentText(text)
             .setContentIntent(pending)
             .setAutoCancel(true)
@@ -63,6 +64,8 @@ object LocalScheduler {
     }
 
     fun schedule(context: Context) {
+        val engine = LocalEngine.get(context)
+        if (engine.isolated) return // Synthetic service tests never replace the owner's alarms.
         val alarm = context.getSystemService(AlarmManager::class.java)
         val pending =
             PendingIntent.getBroadcast(
@@ -72,7 +75,8 @@ object LocalScheduler {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
         alarm.cancel(pending)
-        val engine = LocalEngine.get(context)
+        LocalKeepAliveService.sync(context, engine.enabled && notifications(context) &&
+            exact(context) && engine.db.store().next() != null)
         if (!engine.enabled || !exact(context) || !notifications(context)) return
         val next = engine.db.store().next() ?: return
         // One exact wake starts the preparation window; no second alarm inside Doze is needed.

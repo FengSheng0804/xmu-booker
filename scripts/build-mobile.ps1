@@ -1,5 +1,5 @@
 # Build the independent Android app. Release keys remain outside the public repository.
-param([ValidateSet('debug','release')][string]$Mode = 'debug', [string]$Round = 'R41')
+param([ValidateSet('debug','profile','release')][string]$Mode = 'profile', [string]$Round = 'R41')
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $flutter = Join-Path $projectRoot 'work/toolchains/flutter/bin/flutter.bat'
@@ -13,8 +13,12 @@ $output = Join-Path $projectRoot "outputs/apk/$Round"
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 Push-Location (Join-Path $projectRoot 'apps/mobile')
 try {
+    # Windows PowerShell treats Gradle's informational stderr as NativeCommandError.
+    $ErrorActionPreference = 'Continue'
     & $flutter build apk "--$Mode" --flavor production --target-platform android-arm64 --split-per-abi
-    if ($LASTEXITCODE -ne 0) { throw 'Android build failed' }
+    $buildExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($buildExit -ne 0) { throw 'Android build failed' }
     $source = "build/app/outputs/flutter-apk/app-arm64-v8a-production-$Mode.apk"
     $target = Join-Path $output "xmu-booker-0.2.0-arm64-$Mode.apk"
     Copy-Item -LiteralPath $source -Destination $target

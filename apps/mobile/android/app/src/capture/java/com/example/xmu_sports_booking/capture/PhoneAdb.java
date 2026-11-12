@@ -30,6 +30,7 @@ import org.json.JSONObject;
 public final class PhoneAdb extends AbsAdbConnectionManager {
   private final PrivateKey privateKey;
   private final Certificate certificate;
+  private int connectedPort;
 
   public PhoneAdb(Context context) throws Exception {
     setApi(Build.VERSION.SDK_INT);
@@ -113,7 +114,34 @@ public final class PhoneAdb extends AbsAdbConnectionManager {
 
   public void connectLocal(int port) throws Exception {
     if (port < 1024 || port > 65535) throw new Exception("ADB_PORT_REQUIRED");
-    if (!isConnected() && !connect("127.0.0.1", port)) throw new Exception("ADB_NOT_CONNECTED");
+    try {
+      if (isConnected() && connectedPort == port) return;
+      disconnect();
+      if (!connect("127.0.0.1", port)) throw new IOException("Connection failed");
+      connectedPort = port;
+    } catch (InterruptedException error) {
+      Thread.currentThread().interrupt();
+      throw error;
+    } catch (Exception error) {
+      connectedPort = 0;
+      try { disconnect(); } catch (IOException ignored) {}
+      throw new Exception(AdbConnectionFailure.code(error), error);
+    }
+  }
+
+  public int connectLocal(Context context, int port, Runnable discovering) throws Exception {
+    try {
+      connectLocal(port);
+      return port;
+    } catch (Exception error) {
+      if (!"ADB_CONNECTION_PORT_CLOSED".equals(error.getMessage())
+          && !"ADB_CONNECTION_TIMEOUT".equals(error.getMessage())) throw error;
+      discovering.run();
+      int fresh = LocalAdbDiscovery.find(context);
+      if (fresh == 0 || fresh == port) throw error;
+      connectLocal(fresh);
+      return fresh;
+    }
   }
 
   AdbStream endpoint(String name) throws Exception {

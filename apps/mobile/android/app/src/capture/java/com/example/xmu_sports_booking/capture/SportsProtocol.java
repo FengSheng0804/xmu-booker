@@ -27,6 +27,62 @@ public final class SportsProtocol {
       "rDJiNB9j7vD2"; // Public v58 client profile, not a user credential.
   private static final SecureRandom RANDOM = new SecureRandom();
 
+  /** Rejection details contain only a fixed stage/status and a redacted school explanation. */
+  public static final class ReadRejectedException extends Exception {
+    public final String stage, schoolMessage;
+    public final int status;
+
+    ReadRejectedException(String code, String stage, int status, String schoolMessage) {
+      super(code);
+      this.stage = stage;
+      this.status = status;
+      this.schoolMessage = schoolMessage;
+    }
+
+    public String description() {
+      return "学校授权校验未通过（步骤：" + stage + "，状态：" + status + "）：" + schoolMessage
+          + "。请在微信重新进入学校体育预约页面，再到本机设置更新学校授权后查单；待核对记录会保留。";
+    }
+  }
+
+  static void checkResponse(String path, JSONObject response, String requestBody) throws Exception {
+    if (response.optInt("status", -1) == 1) return;
+    String code, stage;
+    if (path.equals("/v3/api.php/WpLogin/UserInfo")) {
+      code = "READ_CHECK_IDENTITY_REJECTED";
+      stage = "核对本人身份";
+    } else if (path.equals(PREFIX + "/index/index/checklogin")) {
+      code = "READ_CHECK_LOGIN_REJECTED";
+      stage = "建立体育会话";
+    } else {
+      code = "READ_CHECK_ORDERS_REJECTED";
+      stage = "读取本人订单";
+    }
+    String message = "";
+    for (String name : new String[] {"info", "msg", "message"}) {
+      Object value = response.opt(name);
+      if (value instanceof String && !((String) value).isBlank()) {
+        message = (String) value;
+        break;
+      }
+    }
+    message = message.replaceAll("<[^>]*>", " ").replaceAll("[\\p{Cntrl}]", " ")
+        .replaceAll("https?://\\S+", "[链接已隐藏]");
+    for (String item : requestBody.split("&")) {
+      String[] pair = item.split("=", 2);
+      if (pair.length != 2) continue;
+      String value = URLDecoder.decode(pair[1], "UTF-8");
+      if (value.length() >= 3) message = message.replace(value, "[已隐藏]");
+      if (pair[1].length() >= 3) message = message.replace(pair[1], "[已隐藏]");
+    }
+    message = message.replaceAll(
+        "(?i)(token|sign|cookie|phpsessid|student_num|card_id|uid)\\s*[:=]\\s*[^\\s,;，；]+", "$1=[已隐藏]")
+        .replaceAll("[0-9]{5,}", "[号码已隐藏]").trim();
+    if (message.isEmpty()) message = "学校未提供详细原因";
+    throw new ReadRejectedException(code, stage, response.optInt("status", -1),
+        message.substring(0, Math.min(message.length(), 160)));
+  }
+
   public static boolean sportsPage(String raw) {
     try {
       URI url = new URI(raw);
@@ -153,7 +209,7 @@ public final class SportsProtocol {
       }
       Response result = new Response();
       result.json = new JSONObject(data.toString("UTF-8"));
-      if (result.json.optInt("status", -1) != 1) throw new Exception("READ_CHECK_REJECTED");
+      checkResponse(path, result.json, body);
       for (Map.Entry<String, java.util.List<String>> header :
           connection.getHeaderFields().entrySet()) {
         if (!path.equals(PREFIX + "/index/index/checklogin")) continue;
@@ -186,6 +242,22 @@ public final class SportsProtocol {
 
   /** Fresh authenticated UserInfo, one clean checkLogin, one own-orders read. No booking routes. */
   public static JSONObject verifyAndRecord(
+      String query, String expected, java.util.function.Consumer<String> progress)
+      throws Exception {
+    return verifySession(query, expected, progress).record;
+  }
+
+  /** Session material stays in process memory; it is never included in the saved record. */
+  public static final class VerifiedSession {
+    public final JSONObject record;
+    public final String session;
+    public final JSONArray firstOrders;
+    private VerifiedSession(JSONObject record, String session, JSONArray firstOrders) {
+      this.record = record; this.session = session; this.firstOrders = firstOrders;
+    }
+  }
+
+  public static VerifiedSession verifySession(
       String query, String expected, java.util.function.Consumer<String> progress)
       throws Exception {
     TreeMap<String, String> fields = parse(query, expected);
@@ -256,6 +328,6 @@ public final class SportsProtocol {
     record.put("verified_at", System.currentTimeMillis());
     record.put("orders_count", rows.length());
     record.put("source", "OWN_WECHAT_WEBVIEW");
-    return record;
+    return new VerifiedSession(record, entry.session, rows);
   }
 }

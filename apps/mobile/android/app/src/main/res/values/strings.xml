@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 应用名称：使用通用开发标识，不冒充学校官方应用 -->
-    <string name="app_name">厦大体育预约（模拟）</string>
+    <string name="app_name">场馆预约助手</string>
 </resources>

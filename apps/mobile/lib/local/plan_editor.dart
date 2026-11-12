@@ -1,10 +1,18 @@
 import 'package:flutter/material.dart';
 import 'local_api.dart';
+import 'venue_catalog.dart';
+import 'slot_option.dart';
 
 class LocalPlanEditor extends StatefulWidget {
-  const LocalPlanEditor({super.key, required this.venues, this.plan});
+  const LocalPlanEditor({
+    super.key,
+    required this.venues,
+    this.plan,
+    this.initialVenue,
+  });
   final List<Json> venues;
   final Json? plan;
+  final Json? initialVenue;
   @override
   State<LocalPlanEditor> createState() => _LocalPlanEditorState();
 }
@@ -21,16 +29,41 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
   final ranges = List.generate(7, (_) => TextEditingController());
   static const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
   late Json venue;
+  late List<Json> venues;
+  String get campus => venueCampus(venue);
+  List<Json> get campusVenues =>
+      venues.where((v) => venueCampus(v) == campus).toList();
   late DateTime date;
   String repeat = 'ONCE';
-  bool confirmed = false, enabled = false, busy = false;
+  bool confirmed = false, busy = false;
   String? error;
+  String? slotMessage;
   List<Json> slots = [];
+
+  static String venueKey(Json v) =>
+      '${v['stadium_id']}_${v['venue_id']}_${v['category_id']}';
+
+  static String venueLabel(Json v) {
+    final sName = '${v['stadium_name']}'.trim();
+    final pName = '${v['project_name'] ?? ''}'.trim();
+    if (pName.isNotEmpty && !sName.contains(pName)) {
+      return '$sName（$pName）';
+    }
+    return sName;
+  }
+
   @override
   void initState() {
     super.initState();
     final p = widget.plan;
-    venue = p?['venue'] as Json? ?? widget.venues.first;
+    venue = p?['venue'] as Json? ?? widget.initialVenue ?? widget.venues.first;
+    venues = [...widget.venues];
+    final current = venues.where((v) => venueKey(v) == venueKey(venue));
+    if (current.isEmpty) {
+      venues.add(venue);
+    } else {
+      venue = current.first;
+    }
     date = DateTime.tryParse(p?['date']?.toString() ?? '') ??
         beijingToday().add(const Duration(days: 1));
     if (p != null) {
@@ -43,11 +76,15 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
       lead.text = '${p['prepare_lead_seconds']}';
       priority.text = '${p['priority']}';
       confirmed = p['rule_confirmed'] == true;
-      enabled = p['enabled'] == true;
       final days = p['weekdays'] as Map;
       for (var i = 0; i < 7; i++) {
         ranges[i].text = ((days['${i + 1}'] as List?) ?? []).join(', ');
       }
+    }
+    for (final c in ranges) {
+      c.addListener(() {
+        if (mounted) setState(() {});
+      });
     }
   }
 
@@ -68,6 +105,41 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
     super.dispose();
   }
 
+  List<String> getSelectedRanges(int weekdayIndex) {
+    return ranges[weekdayIndex]
+        .text
+        .split(RegExp(r'[,，]'))
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+  }
+
+  void toggleSlot(String timeRange) {
+    final weekdayIndex = date.weekday - 1;
+    final current = getSelectedRanges(weekdayIndex);
+    if (current.contains(timeRange)) {
+      current.remove(timeRange);
+    } else {
+      current.add(timeRange);
+    }
+    ranges[weekdayIndex].text = current.join(', ');
+    setState(() {});
+  }
+
+  void swapPriority(int weekdayIndex, int fromIndex, int toIndex) {
+    final current = getSelectedRanges(weekdayIndex);
+    if (fromIndex < 0 ||
+        fromIndex >= current.length ||
+        toIndex < 0 ||
+        toIndex >= current.length) {
+      return;
+    }
+    final item = current.removeAt(fromIndex);
+    current.insert(toIndex, item);
+    ranges[weekdayIndex].text = current.join(', ');
+    setState(() {});
+  }
+
   String get day => date.toIso8601String().substring(0, 10);
   bool timeValid(String? value) =>
       RegExp(r'^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$').hasMatch(value ?? '');
@@ -85,20 +157,59 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
     setState(() {
       busy = true;
       error = null;
+      slotMessage = null;
     });
     try {
       final data = await const LocalApi().availability({...venue, 'date': day});
       if (mounted) {
-        setState(() => slots = (data['time_slot_list'] as List)
-            .cast<Json>()
-            .where((r) => r['date'] == day)
-            .toList());
+        final totalCapacity = data['personal_num'];
+        final canChoose = data['is_can_choose'];
+        final tips = data['is_can_choose_tips']?.toString();
+        final rawList = (data['time_slot_list'] as List?)?.cast<Json>() ?? [];
+        final daySlots = rawList.where((r) => r['date'] == day).toList();
+        final matchedSlots = daySlots
+            .map((r) => {
+                  ...r,
+                  if ('$canChoose' == '0') 'is_can_choose': 0,
+                  if (tips != null) 'is_can_choose_tips': tips,
+                  'venue_appointment_min_num':
+                      data['venue_appointment_min_num'],
+                  if (totalCapacity != null && !r.containsKey('personal_num'))
+                    'personal_num': totalCapacity,
+                })
+            .toList();
+        setState(() {
+          final resolved = data['resolved_target'];
+          if (resolved is Map<String, dynamic>) {
+            final oldKey = venueKey(venue);
+            final updated = {...venue, ...resolved};
+            if (oldKey != venueKey(updated)) confirmed = false;
+            venues.removeWhere((v) => venueKey(v) == oldKey || venueKey(v) == venueKey(updated));
+            venue = updated;
+            venues.add(venue);
+          }
+          slots = matchedSlots;
+          if (canChoose == 0 || (tips != null && tips.isNotEmpty)) {
+            slotMessage =
+                (tips != null && tips.isNotEmpty) ? tips : '该场馆暂未开放预约或暂无时段数据';
+          } else if (slots.isEmpty) {
+            slotMessage = '当前日期暂未查询到可预约时段';
+          }
+        });
       }
     } catch (e) {
       if (mounted) setState(() => error = localError(e));
     } finally {
       if (mounted) setState(() => busy = false);
     }
+  }
+
+  void changeVenue(Json selected) {
+    venue = selected;
+    slots = [];
+    slotMessage = null;
+    error = null;
+    confirmed = false;
   }
 
   Future<void> save() async {
@@ -118,7 +229,7 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
       setState(() => error = '请至少填写一个入场日的候选时段');
       return;
     }
-    if (enabled && !confirmed) {
+    if (!confirmed) {
       setState(() => error = '启用前请确认学校放号规则');
       return;
     }
@@ -151,7 +262,9 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
         'prepare_lead_seconds': int.parse(lead.text),
         'priority': int.parse(priority.text),
         'rule_confirmed': confirmed,
-        'enabled': enabled
+        'enabled': true,
+        if (widget.plan?['id'] != null && widget.plan?['last_result'] is Map)
+          'reset_execution': true,
       });
       if (mounted) Navigator.pop(context, true);
     } catch (e) {
@@ -169,75 +282,164 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
           child: ListView(padding: const EdgeInsets.all(20), children: [
             const Text('计划只保存在这台手机。学校放号规则须自行核对；新建计划默认暂停。'),
             text('计划名称', name),
-            DropdownButtonFormField<String>(
-                initialValue: venue['venue_id'].toString(),
-                decoration: const InputDecoration(labelText: '场馆'),
-                items: widget.venues
-                    .map((v) => DropdownMenuItem(
-                        value: v['venue_id'].toString(),
-                        child: Text('${v['stadium_name']}')))
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: DropdownButtonFormField<String>(
+                key: const ValueKey('plan-campus'),
+                initialValue: campus,
+                isExpanded: true,
+                decoration: const InputDecoration(labelText: '校区'),
+                items: venueCampuses(venues)
+                    .map((c) => DropdownMenuItem(value: c, child: Text(c)))
                     .toList(),
                 onChanged: busy
                     ? null
-                    : (v) => setState(() => venue = widget.venues.firstWhere(
-                        (item) => item['venue_id'].toString() == v))),
-            DropdownButtonFormField<String>(
-                initialValue: repeat,
-                decoration: const InputDecoration(labelText: '计划类型'),
-                items: const [
-                  DropdownMenuItem(value: 'ONCE', child: Text('单次')),
-                  DropdownMenuItem(value: 'WEEKLY', child: Text('每周'))
-                ],
-                onChanged: busy ? null : (v) => setState(() => repeat = v!)),
-            ListTile(
-                contentPadding: EdgeInsets.zero,
-                title: Text('入场日期：$day（星期${weekdays[date.weekday - 1]}）'),
-                trailing: const Icon(Icons.calendar_month),
-                onTap: busy
-                    ? null
-                    : () async {
-                        final today = beijingToday();
-                        final picked = await showDatePicker(
-                            context: context,
-                            initialDate: date.isBefore(today) ? today : date,
-                            firstDate: today,
-                            lastDate: today.add(const Duration(days: 365)));
-                        if (picked != null) setState(() => date = picked);
-                      }),
-            OutlinedButton(
-                onPressed: busy ? null : query,
-                child: const Text('查询该日学校时段与余量')),
+                    : (c) => setState(() => changeVenue(
+                        venues.firstWhere((v) => venueCampus(v) == c))),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: DropdownButtonFormField<String>(
+                  key: ValueKey('plan-venue-$campus-${venueKey(venue)}'),
+                  initialValue: venueKey(venue),
+                  isExpanded: true,
+                  decoration: const InputDecoration(labelText: '场馆'),
+                  items: campusVenues
+                      .map((v) => DropdownMenuItem<String>(
+                          value: venueKey(v),
+                          child: Text(
+                            venueLabel(v),
+                            overflow: TextOverflow.ellipsis,
+                          )))
+                      .toList(),
+                  onChanged: busy
+                      ? null
+                      : (v) => setState(() {
+                            changeVenue(campusVenues
+                                .firstWhere((item) => venueKey(item) == v));
+                          })),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: DropdownButtonFormField<String>(
+                  initialValue: repeat,
+                  decoration: const InputDecoration(labelText: '计划类型'),
+                  items: const [
+                    DropdownMenuItem(value: 'ONCE', child: Text('单次')),
+                    DropdownMenuItem(value: 'WEEKLY', child: Text('每周'))
+                  ],
+                  onChanged: busy ? null : (v) => setState(() => repeat = v!)),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Material(
+                  key: const ValueKey('entry-date-surface'),
+                  color: Colors.white,
+                  clipBehavior: Clip.antiAlias,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    side: const BorderSide(color: Color(0xFF7A8E9E)),
+                  ),
+                  child: ListTile(
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 4),
+                      title: Text('入场日期：$day（星期${weekdays[date.weekday - 1]}）'),
+                      trailing: const Icon(Icons.calendar_month),
+                      onTap: busy
+                          ? null
+                          : () async {
+                              final today = beijingToday();
+                              final picked = await showDatePicker(
+                                  context: context,
+                                  initialDate:
+                                      date.isBefore(today) ? today : date,
+                                  firstDate: today,
+                                  lastDate:
+                                      today.add(const Duration(days: 365)));
+                              if (picked != null && mounted) {
+                                setState(() {
+                                  date = picked;
+                                  slots = [];
+                                  slotMessage = null;
+                                });
+                              }
+                            })),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: OutlinedButton(
+                  onPressed: busy ? null : query,
+                  child: const Text('查询学校时段与余量')),
+            ),
+            if (slotMessage != null)
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 6),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.amber.shade50,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.amber.shade300),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline,
+                        size: 18, color: Colors.amber.shade900),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        slotMessage!,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.amber.shade900,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             if (slots.isNotEmpty) ...[
-              const Text('点击学校返回的时段，添加到当前选择的入场星期；逗号分隔，顺序即优先级。'),
-              Wrap(
-                  spacing: 8,
-                  children: slots
-                      .map((s) => ActionChip(
-                          label: Text('${s['time_range']}'),
-                          onPressed: busy
-                              ? null
-                              : () {
-                                  final c = ranges[date.weekday - 1];
-                                  final r = '${s['time_range']}';
-                                  if (!c.text
-                                      .split(',')
-                                      .map((e) => e.trim())
-                                      .contains(r)) {
-                                    setState(() => c.text =
-                                        c.text.isEmpty ? r : '${c.text}, $r');
-                                  }
-                                }))
-                      .toList())
+              const Padding(
+                padding: EdgeInsets.only(top: 8, bottom: 4),
+                child: Text(
+                  '学校返回时段（点击左侧时段选择/取消，右侧按键增减优先级）：',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ),
+              Column(
+                children: slots.map((s) {
+                  final r = '${s['time_range']}'.trim();
+                  final weekdayIndex = date.weekday - 1;
+                  final selectedList = getSelectedRanges(weekdayIndex);
+                  final index = selectedList.indexOf(r);
+                  final priorityNum = index >= 0 ? index + 1 : null;
+                  return SlotOption(
+                    range: r,
+                    availability: SlotAvailability.from(s),
+                    priority: priorityNum,
+                    busy: busy,
+                    onToggle: () => toggleSlot(r),
+                    onEarlier: index > 0
+                        ? () => swapPriority(weekdayIndex, index, index - 1)
+                        : null,
+                    onLater: index >= 0 && index < selectedList.length - 1
+                        ? () => swapPriority(weekdayIndex, index, index + 1)
+                        : null,
+                  );
+                }).toList(),
+              ),
+              const SizedBox(height: 12),
             ],
             for (var i = 0; i < 7; i++)
               if (repeat == 'WEEKLY' || i == date.weekday - 1)
                 text('星期${weekdays[i]}候选时段', ranges[i],
-                    hint: '最多3个，例如 08:00-09:00, 09:00-10:00', validate: (s) {
+                    hint: '例如 08:00-09:00, 09:00-10:00，顺序即优先级', validate: (s) {
                   if ((s ?? '').trim().isEmpty) return null;
                   final r =
                       s!.split(RegExp(r'[,，]')).map((e) => e.trim()).toList();
-                  if (r.length > 3 || r.toSet().length != r.length) {
-                    return '最多3个且不能重复';
+                  if (r.toSet().length != r.length) {
+                    return '候选时段不能重复';
                   }
                   for (final t in r) {
                     if (!RegExp(r'^(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d$')
@@ -284,12 +486,7 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                 value: confirmed,
                 onChanged: busy ? null : (v) => setState(() => confirmed = v!),
                 title: const Text('我已核对学校当前放号规则')),
-            SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                value: enabled,
-                onChanged: busy ? null : (v) => setState(() => enabled = v),
-                title: const Text('启用本机计划'),
-                subtitle: const Text('仍需在首页打开真实预约总开关')),
+            const Text('保存后自动启用本机计划，可在计划菜单中暂停。'),
             if (error != null)
               Text(error!,
                   style: TextStyle(color: Theme.of(context).colorScheme.error)),

@@ -65,11 +65,11 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                                 if (generation.get() != current) return@runOperation
                                 preferences.edit().putBoolean("paired", true).apply()
                                 if (connectPort in 1024..65535) {
-                                    adb.connectLocal(connectPort)
+                                    val actualPort = connectAdb(adb, connectPort)
                                     connected = true
                                     preferences
                                         .edit()
-                                        .putInt("connection_port", connectPort)
+                                        .putInt("connection_port", actualPort)
                                         .apply()
                                 }
                                 stage = "READY"
@@ -79,9 +79,9 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                         val port = call.argument<Int>("connection_port") ?: 0
                         runOperation(reply) { _ ->
                             stage = "CONNECTING_LOCAL_ADB"
-                            getAdb().connectLocal(port)
+                            val actualPort = connectAdb(getAdb(), port)
                             connected = true
-                            preferences.edit().putInt("connection_port", port).apply()
+                            preferences.edit().putInt("connection_port", actualPort).apply()
                             stage = "READY"
                         }
                     }
@@ -91,13 +91,13 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                                 ?: preferences.getInt("connection_port", 0)
                         runOperation(reply) { _ ->
                             val adb = getAdb()
-                            adb.connectLocal(port)
+                            val actualPort = connectAdb(adb, port)
                             connected = true
                             val visible = SportsCaptureEngine().debugVisible(adb)
                             preferences
                                 .edit()
                                 .putBoolean("debug_visible", visible)
-                                .putInt("connection_port", port)
+                                .putInt("connection_port", actualPort)
                                 .apply()
                             if (!visible) throw Exception("WECHAT_DEBUG_NOT_ENABLED")
                             stage = "WECHAT_DEBUG_READY"
@@ -111,15 +111,15 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                         if (!account.matches(Regex("[0-9]{6,24}")))
                             reply.error("ACCOUNT_REQUIRED", "请填写本人的学号", null)
                         else {
-                            activity.startForegroundService(
-                                Intent(activity, CaptureKeepAliveService::class.java)
-                            )
                             runOperation(reply) { current ->
+                                activity.startForegroundService(
+                                    Intent(activity, CaptureKeepAliveService::class.java)
+                                )
                                 stage = "CONNECTING_LOCAL_ADB"
                                 val adb = getAdb()
-                                adb.connectLocal(port)
+                                val actualPort = connectAdb(adb, port)
                                 connected = true
-                                preferences.edit().putInt("connection_port", port).apply()
+                                preferences.edit().putInt("connection_port", actualPort).apply()
                                 vault.saveSecret("expected_student", account)
                                 val capture = SportsCaptureEngine()
                                 engine = capture
@@ -168,6 +168,11 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
 
     private fun getAdb(): PhoneAdb = phoneAdb ?: PhoneAdb(activity).also { phoneAdb = it }
 
+    private fun connectAdb(adb: PhoneAdb, port: Int): Int {
+        connected = false
+        return adb.connectLocal(activity, port) { stage = "DISCOVERING_LOCAL_ADB" }
+    }
+
     private fun runOperation(
         reply: MethodChannel.Result,
         resultProvider: () -> Any = { metadata() },
@@ -210,7 +215,8 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                 stage = code
                 main.post {
                     if (generation.get() == current) {
-                        pending?.error(code, code, null)
+                        pending?.error(code,
+                            (error as? SportsProtocol.ReadRejectedException)?.description() ?: code, null)
                         pending = null
                         engine = null
                         activity.stopService(Intent(activity, CaptureKeepAliveService::class.java))
@@ -224,7 +230,7 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
     private fun metadata(): Map<String, Any> {
         val result =
             mutableMapOf<String, Any>(
-                "adb_connected" to connected,
+                "adb_connected" to (connected && phoneAdb?.isConnected == true),
                 "adb_paired" to preferences.getBoolean("paired", false),
                 "connection_port" to preferences.getInt("connection_port", 0),
                 "capture_stage" to (engine?.stage ?: stage),
@@ -250,6 +256,9 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                     "SPORTS_PAGE_NOT_FOUND",
                     "READ_CHECK_HTTP_FAILED",
                     "READ_CHECK_REJECTED",
+                    "READ_CHECK_IDENTITY_REJECTED",
+                    "READ_CHECK_LOGIN_REJECTED",
+                    "READ_CHECK_ORDERS_REJECTED",
                     "SCOPED_SESSION_MISSING",
                     "IDENTITY_CONTEXT_MISMATCH",
                     "ORDERS_OWNER_MISMATCH",
@@ -262,6 +271,10 @@ class CaptureBridge(private val activity: FlutterActivity, channel: MethodChanne
                     "PAIRING_CODE_REJECTED",
                     "PAIRING_CRYPTO_FAILED",
                     "ADB_NOT_CONNECTED",
+                    "ADB_CONNECTION_PORT_CLOSED",
+                    "ADB_CONNECTION_TIMEOUT",
+                    "ADB_CONNECTION_TLS_FAILED",
+                    "ADB_PAIRING_REQUIRED",
                 )
         )
             code!!

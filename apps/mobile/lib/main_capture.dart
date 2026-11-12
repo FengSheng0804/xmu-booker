@@ -50,6 +50,9 @@ class _OwnSportsCapturePageState extends State<OwnSportsCapturePage>
     'OWNER_MISMATCH': '页面中的学校身份与填写的学号不一致，已拒绝保存',
     'READ_CHECK_HTTP_FAILED': '学校服务连接未完成，请联网后重试',
     'READ_CHECK_REJECTED': '学校未接受本次授权，请重新完成微信中的学校认证',
+    'READ_CHECK_IDENTITY_REJECTED': '学校本人身份校验未通过，请重新进入学校体育页面并更新授权',
+    'READ_CHECK_LOGIN_REJECTED': '学校未能建立体育会话，请重新进入学校体育页面并更新授权',
+    'READ_CHECK_ORDERS_REJECTED': '学校未接受本人订单读取，请重新进入学校体育页面并更新授权',
     'SCOPED_SESSION_MISSING': '尚未取得可用于体育查询的会话',
     'IDENTITY_CONTEXT_MISMATCH': '学校返回的身份与页面上下文不一致，已拒绝保存',
     'ORDERS_OWNER_MISMATCH': '订单归属核对不一致，已拒绝保存',
@@ -57,6 +60,10 @@ class _OwnSportsCapturePageState extends State<OwnSportsCapturePage>
     'ACCOUNT_REQUIRED': '请填写本人的学号',
     'ADB_PORT_REQUIRED': '请填写无线调试主页面显示的连接端口',
     'ADB_NOT_CONNECTED': '本机无线调试未连接，请确认开关和连接端口',
+    'ADB_CONNECTION_PORT_CLOSED': '无线调试连接端口已关闭或已变化，自动检测未找到新端口。请打开无线调试主页面，将“IP地址和端口”末尾的当前端口填入下方，再点“开始微信授权”；不需要重复配对。',
+    'ADB_CONNECTION_TIMEOUT': '连接本机无线调试超时，请确认无线调试开启，并填写主页面当前连接端口后重试',
+    'ADB_CONNECTION_TLS_FAILED': '本机无线调试加密连接失败，请确认使用的是主页面连接端口；仍失败时再重新配对',
+    'ADB_PAIRING_REQUIRED': '系统未接受此 App 的调试身份，请重新配对本手机后再连接',
     'PAIRING_INPUT_REQUIRED': '请填写系统显示的配对端口和六位配对码',
     'PAIRING_FAILED': '系统配对未完成，请重新打开配对码窗口再试',
     'PAIRING_PORT_CLOSED': '配对端口已关闭或填错。请分屏保持系统配对码窗口打开，重新填写该窗口的端口（不是连接端口）',
@@ -68,6 +75,7 @@ class _OwnSportsCapturePageState extends State<OwnSportsCapturePage>
   static const stages = {
     'PAIRING_LOCAL_ADB': '正在与手机系统配对…',
     'CONNECTING_LOCAL_ADB': '正在连接本机调试服务…',
+    'DISCOVERING_LOCAL_ADB': '旧端口不可用，正在检测本机当前连接端口…',
     'FINDING_WECHAT_PAGE': '等待微信中的体育预约页面…',
     'READING_SPORTS_AUTHORIZATION': '已找到体育页面，正在读取授权…',
     'OWN_CONTEXT_READ': '已读取页面授权…',
@@ -102,16 +110,25 @@ class _OwnSportsCapturePageState extends State<OwnSportsCapturePage>
       if (wasBusy && !busy) return;
       setState(() {
         if (wasBusy) {
-          status = {...status, 'capture_stage': data?['capture_stage']};
+          final actualPort = data?['connection_port'];
+          if (actualPort is int && actualPort > 0 &&
+              actualPort != status['connection_port']) {
+            connectionPort.text = '$actualPort';
+          }
+          status = {...status, 'capture_stage': data?['capture_stage'],
+            if (actualPort is int && actualPort > 0) 'connection_port': actualPort,
+            if (data?['adb_connected'] is bool) 'adb_connected': data!['adb_connected']};
           return;
         }
+        final previousPort = status['connection_port'];
         status = data ?? {};
         if (student.text.isEmpty &&
             status['expected_student'] is String &&
             status['has_token'] != true) {
           student.text = status['expected_student'];
         }
-        if (connectionPort.text.isEmpty &&
+        if ((connectionPort.text.isEmpty ||
+                (busy && status['connection_port'] != previousPort)) &&
             (status['connection_port'] as int? ?? 0) > 0) {
           connectionPort.text = '${status['connection_port']}';
         }
@@ -145,6 +162,10 @@ class _OwnSportsCapturePageState extends State<OwnSportsCapturePage>
       if (mounted) {
         setState(() {
           status = data ?? {};
+          final actualPort = status['connection_port'];
+          if (actualPort is int && actualPort > 0) {
+            connectionPort.text = '$actualPort';
+          }
           message = success;
         });
       }

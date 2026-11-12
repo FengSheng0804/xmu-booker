@@ -6,13 +6,18 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
     <application
-        android:label="体育预约测试"
+        android:label="@string/app_name"
         android:usesCleartextTraffic="false"
         android:allowBackup="false"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher">
         <service android:name=".local.LocalBookingService" android:exported="false" android:foregroundServiceType="dataSync" />
+        <service android:name=".local.LocalKeepAliveService" android:exported="false" android:stopWithTask="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Visible supervision of user-scheduled local booking plans and exact-alarm recovery; no continuous idle wake lock" />
+        </service>
         <receiver android:name=".local.LocalAlarmReceiver" android:exported="false" />
         <receiver android:name=".local.LocalRestoreReceiver" android:exported="false">
             <intent-filter>

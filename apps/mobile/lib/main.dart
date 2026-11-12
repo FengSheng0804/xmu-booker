@@ -29,7 +29,7 @@ class XmuApp extends StatelessWidget {
   const XmuApp({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: '厦大体育预约',
+        title: '场馆预约助手',
         theme: buildTheme(),
         home: const LocalHomePage(),
         locale: const Locale('zh', 'CN'),

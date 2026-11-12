@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import '../main_capture.dart';
 import 'local_api.dart';
 import 'plan_editor.dart';
+import 'venue_catalog.dart';
+import 'entry_pass.dart';
 
 class LocalHomePage extends StatefulWidget {
   const LocalHomePage({super.key});
@@ -17,6 +19,8 @@ class _LocalHomePageState extends State<LocalHomePage>
   int tab = 0;
   bool busy = false;
   String? error;
+  String? selectedCampus;
+  int visibleOrders = 10, visibleMessages = 10;
   Timer? timer;
   static const titles = ['本机预约', '计划与任务', '学校订单', '本机设置'];
   @override
@@ -81,7 +85,8 @@ class _LocalHomePageState extends State<LocalHomePage>
     }
   }
 
-  Future<bool> confirm(String title, String text) async =>
+  Future<bool> confirm(String title, String text,
+          {String confirmText = '确认'}) async =>
       await showDialog<bool>(
           context: context,
           builder: (c) =>
@@ -91,10 +96,65 @@ class _LocalHomePageState extends State<LocalHomePage>
                     child: const Text('取消')),
                 FilledButton(
                     onPressed: () => Navigator.pop(c, true),
-                    child: const Text('确认'))
+                    child: Text(confirmText))
               ])) ??
       false;
   List<Json> rows(String key) => ((data?[key] as List?) ?? []).cast<Json>();
+
+  bool loadMore(ScrollNotification notification) {
+    if (notification.depth != 0 || notification is! ScrollUpdateNotification ||
+        (notification.scrollDelta ?? 0) <= 0 || notification.metrics.extentAfter > 100) {
+      return false;
+    }
+    if (tab == 2 && visibleOrders < rows('orders').length) {
+      setState(() => visibleOrders += 10);
+    } else if (tab == 0 && visibleMessages < rows('messages').length) {
+      setState(() => visibleMessages += 10);
+    }
+    return false;
+  }
+
+  Widget pageHint(String kind, int visible, int total) => Padding(
+      key: ValueKey('$kind-page-footer'), padding: const EdgeInsets.all(12),
+      child: Text(visible < total ? '继续下滑加载更多${kind == 'orders' ? '订单' : '消息'}（已显示 $visible/$total）'
+          : '已显示全部${kind == 'orders' ? '订单' : '消息'}'));
+
+  Future<void> deleteRecord(Json task) async {
+    if (busy) return;
+    if (await confirm('删除执行记录？', '该记录将从执行记录列表移除，学校已有预约不会取消。', confirmText: '删除')) {
+      await action(() => api.deleteExecutionRecord('${task['id']}'));
+    }
+  }
+
+  Future<void> planAction(String actionName, Json plan) async {
+    if (actionName == 'edit') { await editor(plan); return; }
+    if (actionName == 'copy') {
+      await editor({...plan}..remove('id')..['enabled'] = false..['name'] = '${plan['name']} 副本');
+      return;
+    }
+    if (actionName == 'toggle') {
+      await action(() => api.savePlan({...plan, 'enabled': plan['enabled'] != true}));
+    } else if (actionName == 'delete' && await confirm('删除计划？',
+        '未提交的任务将取消。已经提交的学校预约不会被取消，历史执行记录保留。')) {
+      await action(() => api.deletePlan('${plan['id']}'));
+    }
+  }
+
+  void showPlan(Json plan) {
+    showModalBottomSheet<void>(context: context, isScrollControlled: true,
+      builder: (c) => SafeArea(child: SingleChildScrollView(padding: const EdgeInsets.all(24),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('${plan['name']}', style: Theme.of(c).textTheme.titleLarge),
+          Text('${plan['venue']['stadium_name']} · ${planStatus(plan)}'),
+          Text('${plan['repeat'] == 'WEEKLY' ? '每周' : '入场日 ${plan['date']}'} · 执行 ${plan['execution_time']} 北京时间'),
+          for (final entry in (plan['weekdays'] as Map).entries)
+            Text('星期${entry.key}：${(entry.value as List).join(' → ')}'),
+          if (plan['last_result'] is Map)
+            Text('最近执行：${stateText(plan['last_result']['state'])} · ${executionReason(plan['last_result']['reason'])}'),
+          if (singlePlanEnded(plan)) const Text('单次计划已结束，重新预约请复制计划或修改入场日期'),
+          FilledButton(onPressed: () { Navigator.pop(c); editor(plan); }, child: const Text('编辑计划')),
+        ]))));
+  }
   Widget card(String title, List<Widget> children) => Card(
       child: Padding(
           padding: const EdgeInsets.all(18),
@@ -104,7 +164,7 @@ class _LocalHomePageState extends State<LocalHomePage>
             const SizedBox(height: 12),
             ...children
           ])));
-  Future<void> editor([Json? plan]) async {
+  Future<void> editor([Json? plan, Json? initialVenue]) async {
     final venues = rows('venues');
     if (venues.isEmpty) {
       setState(() => error = '请先在首页同步学校场馆');
@@ -113,18 +173,26 @@ class _LocalHomePageState extends State<LocalHomePage>
     await Navigator.push(
         context,
         MaterialPageRoute(
-            builder: (_) => LocalPlanEditor(venues: venues, plan: plan)));
+            builder: (_) => LocalPlanEditor(
+                venues: venues, plan: plan, initialVenue: initialVenue)));
     await refresh();
   }
 
   List<Widget> home() {
+    final venues = rows('venues');
+    final campuses = venueCampuses(venues);
+    final campus = campuses.contains(selectedCampus)
+        ? selectedCampus
+        : campuses.firstOrNull;
     final auth = (data?['authorization'] as Map?) ?? {};
     final permissions = (data?['permissions'] as Map?) ?? {};
     final next = rows('tasks').where((t) => t['state'] == 'PENDING').toList()
       ..sort((a, b) => (a['run_at'] as num).compareTo(b['run_at'] as num));
+    final ready = auth['has_token'] == true && data?['execution_enabled'] == true &&
+        permissions['notifications'] == true && permissions['exact_alarm'] == true;
     return [
       card('所有预约都在这台手机运行', [
-        const Text('无需项目账号、服务器或卡密。只有手机与学校系统通信，计划和授权留在本机。'),
+        const Text('无需项目账号、服务器。只有手机与学校系统通信，计划和授权留在本机。'),
         Text(auth['has_token'] == true
             ? '本机学校授权：${auth['owner']}'
             : '尚未获取本人学校授权'),
@@ -141,28 +209,23 @@ class _LocalHomePageState extends State<LocalHomePage>
             child: const Text('获取或更新本机授权')),
       ]),
       card('执行状态', [
-        SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('允许真实预约'),
-            value: data?['execution_enabled'] == true,
-            onChanged: busy
-                ? null
-                : (v) => action(() async {
-                      if (!v ||
-                          await confirm('开启真实预约？',
-                              '已启用计划将在这台手机直接向学校提交。请先核对本人授权、时段与学校放号规则。')) {
-                        await api.setExecution(v);
-                      }
-                    })),
-        Text(
-            '通知：${permissions['notifications'] == true ? '已允许' : '未允许'} · 精确闹钟：${permissions['exact_alarm'] == true ? '已允许' : '未允许'}'),
-        Text(permissions['notifications'] == true &&
-                permissions['exact_alarm'] == true
-            ? '可安排后台窗口；仍受系统省电限制'
-            : '后台条件不完整，请在设置中处理；可在执行窗口内打开App执行'),
-        Text(
-            '下次执行：${next.isEmpty ? '暂无已安排任务' : beijingMillis(next.first['run_at'])}'),
-        const Text('强制停止App后任务不会执行，需重新打开恢复调度。断网或授权失效时会停止并提示。'),
+        ListTile(contentPadding: EdgeInsets.zero,
+          leading: Icon(ready ? Icons.check_circle_outline : Icons.info_outline,
+            color: ready ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.error),
+          title: Text(!ready ? '需要完善执行条件' : next.isEmpty ? '暂无待执行计划' : '已安排自动执行'),
+          subtitle: Text(!ready ? '请检查学校授权和后台权限' : next.isEmpty ? '创建计划后将自动启用' :
+            '${next.first['target']['stadium_name']}\n${beijingMillis(next.first['run_at'])}'),
+        ),
+        Wrap(spacing: 8, runSpacing: 4, children: [
+          Chip(label: Text('待执行 ${next.length} 项')),
+          Chip(label: Text(permissions['keep_alive_active'] == true ? '后台守护运行中' : '后台守护待命')),
+        ]),
+        ExpansionTile(key: const PageStorageKey('execution-conditions'), tilePadding: EdgeInsets.zero, title: const Text('查看执行条件'), children: [
+          for (final (label, key) in [('通知', 'notifications'), ('精确闹钟', 'exact_alarm'), ('不受电池优化限制', 'battery_unrestricted')])
+            ListTile(dense: true, title: Text(label), trailing: Icon(permissions[key] == true ? Icons.check : Icons.warning_amber)),
+          const Text('保存后自动启用，可在计划菜单暂停。强制停止后需重新打开；断网或授权失效时会提示。'),
+          TextButton(onPressed: () => setState(() => tab = 3), child: const Text('管理后台权限')),
+        ]),
       ]),
       card('学校场馆', [
         FilledButton.tonal(
@@ -174,21 +237,33 @@ class _LocalHomePageState extends State<LocalHomePage>
             child: const Text('同步学校场馆与当前时段')),
         Text('最近同步：${beijingMillis(data?['venues_updated_at'])}'),
         if (rows('venues').isEmpty) const Text('尚无已校验场馆。完成授权后同步。'),
-        for (final venue in rows('venues'))
+        if (campus != null)
+          DropdownButtonFormField<String>(
+            key: ValueKey('home-campus-$campus'),
+            initialValue: campus,
+            isExpanded: true,
+            decoration: const InputDecoration(labelText: '校区'),
+            items: campuses
+                .map((c) => DropdownMenuItem(value: c, child: Text(c)))
+                .toList(),
+            onChanged: busy ? null : (c) => setState(() => selectedCampus = c),
+          ),
+        for (final venue in venues.where((v) => venueCampus(v) == campus))
           ListTile(
               contentPadding: EdgeInsets.zero,
               title: Text('${venue['stadium_name']}'),
               subtitle: Text('${venue['project_name']}'),
               trailing: const Icon(Icons.chevron_right),
-              onTap: () => editor()),
+              onTap: () => editor(null, venue)),
       ]),
       card('本地消息', [
         if (rows('messages').isEmpty) const Text('暂无执行消息'),
-        for (final message in rows('messages').take(10))
+        for (final message in rows('messages').take(visibleMessages))
           ListTile(
               contentPadding: EdgeInsets.zero,
               title: Text('${message['text']}'),
               subtitle: Text(beijingMillis(message['created_at']))),
+        if (rows('messages').isNotEmpty) pageHint('messages', visibleMessages.clamp(0, rows('messages').length), rows('messages').length),
       ]),
     ];
   }
@@ -201,59 +276,62 @@ class _LocalHomePageState extends State<LocalHomePage>
         if (rows('plans').isEmpty)
           const Padding(
               padding: EdgeInsets.all(24),
-              child: Text('尚无计划。同步场馆后可创建；新计划默认暂停。')),
+              child: Text('尚无计划。同步场馆后可创建，保存后自动启用。')),
         for (final p in rows('plans'))
-          card('${p['name']}', [
-            Text(
-                '${p['venue']['stadium_name']} · ${p['repeat'] == 'WEEKLY' ? '每周' : '单次 ${p['date']}'}'),
-            Text(
-                '执行 ${p['execution_time']} 北京时间 · ${p['enabled'] == true ? '已启用' : '已暂停'}'),
-            for (final e in (p['weekdays'] as Map).entries)
-              Text('星期${e.key}：${(e.value as List).join(' → ')}'),
-            Wrap(spacing: 8, children: [
-              OutlinedButton(
-                  onPressed: busy ? null : () => editor(p),
-                  child: const Text('编辑')),
-              OutlinedButton(
-                  onPressed: busy
-                      ? null
-                      : () => editor({...p}
-                        ..remove('id')
-                        ..['enabled'] = false
-                        ..['name'] = '${p['name']} 副本'),
-                  child: const Text('复制')),
-              TextButton(
-                  onPressed: busy
-                      ? null
-                      : () => action(() async {
-                            await api.savePlan(
-                                {...p, 'enabled': p['enabled'] != true});
-                          }),
-                  child: Text(p['enabled'] == true ? '暂停' : '启用')),
-              TextButton(
-                  onPressed: busy
-                      ? null
-                      : () => action(() async {
-                            if (await confirm('删除计划？',
-                                '未提交的任务将取消。已经提交的学校预约不会被取消，历史执行记录保留。')) {
-                              await api.deletePlan('${p['id']}');
-                            }
-                          }),
-                  child: const Text('删除')),
-            ]),
-          ]),
+          Card(key: ValueKey('plan-card-${p['id']}'), child: ListTile(
+            title: Text('${p['name']}', maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text('${p['venue']['stadium_name']}\n'
+                '${p['repeat'] == 'WEEKLY' ? '每周' : p['date']} · ${p['execution_time']} · '
+                '${planStatus(p).replaceAll('预约成功（学校订单已确认）', '预约成功').replaceAll('需要核对，禁止重发', '待核对')}',
+                maxLines: 3, overflow: TextOverflow.ellipsis),
+            onTap: () => showPlan(p),
+            trailing: PopupMenuButton<String>(tooltip: '计划操作', enabled: !busy,
+              onSelected: (value) => planAction(value, p),
+              itemBuilder: (_) => [
+                const PopupMenuItem(value: 'edit', child: Text('编辑')),
+                const PopupMenuItem(value: 'copy', child: Text('复制')),
+                if (!singlePlanEnded(p)) PopupMenuItem(value: 'toggle', child: Text(p['enabled'] == true ? '暂停' : '启用')),
+                const PopupMenuItem(value: 'delete', child: Text('删除')),
+              ]))),
         const Padding(
             padding: EdgeInsets.all(12),
             child: Text('执行记录', style: TextStyle(fontWeight: FontWeight.bold))),
         for (final t in rows('tasks'))
-          Card(
+          Card(key: ValueKey('execution-record-${t['id']}'),
               child: ListTile(
                   title: Text('${stateText(t['state'])} · ${t['date']}'),
                   subtitle: Text(
-                      '${t['target']['stadium_name']}\n${beijingMillis(t['run_at'])}\n${t['reason']}'),
+                      '${t['target']['stadium_name']}\n${beijingMillis(t['run_at'])}\n${executionReason(t['reason'])}'),
                   isThreeLine: true,
+                  trailing: !['PENDING', 'CLAIMED', 'SENT'].contains(t['state'])
+                      ? IconButton(tooltip: '删除执行记录', icon: const Icon(Icons.delete_outline),
+                          onPressed: busy ? null : () => deleteRecord(t)) : null,
                   onTap: () => showTask(t))),
       ];
+  Future<void> reviewTask(String id) => action(() async {
+        final checked = await api.inspectTask(id);
+        if (!mounted) return;
+        if (checked['can_release'] == true) {
+          final target = checked['target'] as Map;
+          final approved = await confirm(
+              '确认学校无订单后解除阻塞',
+              '已完整读取本人学校订单，未找到对应预约。\n'
+                  '${target['stadium_name']} · ${checked['date']}\n'
+                  '候选：${(target['ranges'] as List).join(' → ')}\n\n'
+                  '请同时核对学校原入口没有对应订单（含待支付订单）。'
+                  '确认后只结束这条旧任务，不会重新预约。',
+              confirmText: '已核对无订单，解除阻塞');
+          if (!approved) return;
+          final resolved = await api.releaseTask(id);
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text(executionReason(resolved['reason']))));
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text(executionReason(checked['reason']))));
+        }
+      });
+
   void showTask(Json task) {
     showModalBottomSheet<void>(
         context: context,
@@ -273,20 +351,50 @@ class _LocalHomePageState extends State<LocalHomePage>
                           '候选：${(task['target']['ranges'] as List).join(' → ')}'),
                       Text('执行：${beijingMillis(task['run_at'])}'),
                       Text('截止：${beijingMillis(task['deadline'])}'),
-                      Text('${task['reason']}'),
+                      Text(executionReason(task['reason'])),
+                      if (task['state'] == 'SUCCEEDED') TextButton(onPressed: () {
+                        Navigator.pop(c); setState(() => tab = 2);
+                      }, child: const Text('前往学校订单查看入场码')),
                       const Text('结果未知时只核对学校订单，不会再次提交。'),
-                      if (['PENDING', 'UNKNOWN', 'SENT', 'CLAIMED']
-                          .contains(task['state']))
+                      if ('${task['reason'] ?? ''}'
+                          .contains('PENDING_RECONCILIATION')) ...[
+                        const SizedBox(height: 12),
+                        if (((task['blocking_tasks'] as List?) ?? []).isEmpty)
+                          const Text('旧任务阻塞已解除；此计划未执行，需要预约时请另建计划。'),
+                        for (final old
+                            in ((task['blocking_tasks'] as List?) ?? [])
+                                .cast<Map>())
+                          if (old['state'] == 'UNKNOWN')
+                            OutlinedButton(
+                              onPressed: busy
+                                  ? null
+                                  : () {
+                                      Navigator.pop(c);
+                                      reviewTask('${old['id']}');
+                                    },
+                              child: Text('核对并处理旧任务（${old['date']}）'),
+                            )
+                          else
+                            const Text('旧任务仍在执行，请稍后刷新再核对。'),
+                      ],
+                      if (['SENT', 'CLAIMED'].contains(task['state']))
+                        const Text('任务正在执行，待结果返回后再核对。'),
+                      if (['PENDING', 'UNKNOWN'].contains(task['state']))
                         FilledButton(
                             onPressed: busy
                                 ? null
                                 : () {
                                     Navigator.pop(c);
-                                    action(() => api.runTask('${task['id']}'));
+                                    if (task['state'] == 'UNKNOWN') {
+                                      reviewTask('${task['id']}');
+                                    } else {
+                                      action(
+                                          () => api.runTask('${task['id']}'));
+                                    }
                                   },
                             child: Text(task['state'] == 'PENDING'
                                 ? '在执行窗口内运行'
-                                : '只查单核对')),
+                                : '查单并处理阻塞')),
                     ]))));
   }
 
@@ -304,17 +412,26 @@ class _LocalHomePageState extends State<LocalHomePage>
         if (rows('orders').isEmpty)
           const Padding(
               padding: EdgeInsets.all(24), child: Text('尚未同步订单，或学校未返回本人订单。')),
-        for (final order in rows('orders'))
-          card(
-              '${order['stadium_name'] ?? '学校预约'} · ${order['audit_status_text'] ?? '查看详情'}',
-              [
-                Text('${order['project_name'] ?? ''}'),
-                for (final d in ((order['detail'] as List?) ?? []).cast<Map>())
-                  Text(
-                      '${d['date']} ${d['interval_time']} · ${d['area_name']} · ${d['status_text'] ?? ''}'),
-                SelectableText('学校订单号：${order['order_id']}'),
-              ]),
+        for (final order in rows('orders').take(visibleOrders))
+          Card(key: ValueKey('order-${order['order_id']}'), child: ListTile(
+            title: Text('${order['stadium_name'] ?? '学校预约'} · ${order['audit_status_text'] ?? '查看详情'}'),
+            subtitle: Text([for (final d in ((order['detail'] as List?) ?? []).cast<Map>())
+              '${d['date']} ${d['interval_time']} · ${d['status_text'] ?? ''}'].join('\n'), maxLines: 2, overflow: TextOverflow.ellipsis),
+            trailing: const Icon(Icons.chevron_right), onTap: () => showOrder(order))),
+        if (rows('orders').isNotEmpty) pageHint('orders', visibleOrders.clamp(0, rows('orders').length), rows('orders').length),
       ];
+  void showOrder(Json order) {
+    showModalBottomSheet<void>(context: context, isScrollControlled: true,
+      builder: (c) => SafeArea(child: SingleChildScrollView(padding: const EdgeInsets.all(24),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('${order['stadium_name'] ?? '学校预约'}', style: Theme.of(c).textTheme.titleLarge),
+          Text('${order['project_name'] ?? ''} · ${order['audit_status_text'] ?? ''}'),
+          for (final d in ((order['detail'] as List?) ?? []).cast<Map>())
+            Text('${d['date']} ${d['interval_time']} · ${d['area_name']} · ${d['status_text'] ?? ''}'),
+          SelectableText('学校订单号：${order['order_id']}'),
+          EntryPassView(orderId: '${order['order_id']}'),
+        ]))));
+  }
   List<Widget> settings() {
     final permissions = (data?['permissions'] as Map?) ?? {};
     return [
@@ -330,7 +447,18 @@ class _LocalHomePageState extends State<LocalHomePage>
               subtitle: Text(permissions[key] == true ? '已具备' : '需检查系统设置'),
               trailing: const Icon(Icons.open_in_new),
               onTap: busy ? null : () => action(() => api.settings(kind))),
-        const Text('系统可能延迟或终止后台任务。请允许本App后台运行；强制停止后重新打开。执行窗口内可以从任务详情手动运行。'),
+        Text(permissions['keep_alive_active'] == true ? '后台守护运行中，通知栏可查看。' : '有待执行计划且权限齐全时，自动启动后台守护。'),
+        const Text('请在手机系统中允许后台运行与自启动。系统强制停止后需重新打开恢复。'),
+      ]),
+      card('存储管理', [
+        const Text('自动清理旧版调试资源和诊断临时文件，保留学校授权、计划、订单和执行历史。'),
+        OutlinedButton(onPressed: busy ? null : () => action(() async {
+          final bytes = await api.cleanStorage();
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              content: Text('已释放 ${(bytes / 1048576).toStringAsFixed(1)} MB')));
+          }
+        }), child: const Text('清理临时文件')),
       ]),
       card('授权与隐私', [
         const Text(
@@ -363,7 +491,7 @@ class _LocalHomePageState extends State<LocalHomePage>
         TextButton(
             onPressed: () => showLicensePage(
                 context: context,
-                applicationName: '厦大体育预约',
+                applicationName: '场馆预约助手',
                 applicationLegalese: 'GPL-3.0 · 第三方组件按各自许可分发'),
             child: const Text('开源许可')),
       ]),
@@ -398,11 +526,13 @@ class _LocalHomePageState extends State<LocalHomePage>
                         : const Text('无法读取本机状态，请重试'))
                 : RefreshIndicator(
                     onRefresh: refresh,
-                    child:
-                        ListView(padding: const EdgeInsets.all(16), children: [
-                      ...[home, plans, orders, settings][tab](),
-                      const SizedBox(height: 24)
-                    ]))),
+                    child: NotificationListener<ScrollNotification>(onNotification: loadMore,
+                      child: Builder(builder: (_) {
+                        final children = [...[home, plans, orders, settings][tab](), const SizedBox(height: 24)];
+                        return ListView.builder(key: PageStorageKey('local-tab-$tab'),
+                          padding: const EdgeInsets.all(16), itemCount: children.length,
+                          itemBuilder: (_, index) => children[index]);
+                      })))),
       ])),
       bottomNavigationBar: NavigationBar(
           selectedIndex: tab,
