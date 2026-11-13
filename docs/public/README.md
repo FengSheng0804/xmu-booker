@@ -1,6 +1,6 @@
 # Android 独立版使用与构建
 
-维护作者：Codex；更新日期：2026-11-13（Asia/Shanghai）；轮次：R71。文档类型：公开使用说明；验证状态：正式APK本地构建和签名校验通过，GitHub新流水线需配置签名Secrets并提交后验证；其余检查见对应轮次报告。
+文档类型：公开使用说明；验证状态：GitHub正式APK构建及API30/35检查已成功，自动创建Release的新步骤需提交后验证；其余检查见对应轮次报告。
 
 ## 安装与授权
 
@@ -54,16 +54,18 @@ cd android
 
 ### GitHub生成正式APK
 
-GitHub Actions对所有提交运行源码和设备测试；主分支检查全部通过后，`release-apk`任务使用正式签名构建Release版，不再上传调试APK。下载运行结果Artifacts中的`xmu-booker-arm64-release`，解压得到`xmu-booker-arm64-release.apk`及`SHA256SUMS`，产物保留90天。此配置保存Actions构建产物，不会自动发布GitHub Release。
+GitHub Actions对所有提交运行源码和设备测试；主分支检查全部通过后，`release-apk`任务使用正式签名构建Release版，不再上传调试APK。可直接从仓库Releases下载`xmu-booker-arm64-release.apk`，同时提供`SHA256SUMS`。发布标签包含App版本、构建号及提交号，例如`v0.2.0-build.14-2d3e4606bb05`，避免旧标签与新代码混用；同一提交重跑时复用发布并更新附件。删除某个Release后，只有再次执行包含发布步骤的工作流才会创建它，删除本身不会触发重建。
+
+同时保留运行结果Artifacts中的`xmu-booker-arm64-release`，其ZIP内含相同APK和校验文件，Actions产物保留90天。只保存Artifacts的旧工作流即使全部成功也不会创建Release；需先提交自动发布步骤，再触发新的main构建，重跑旧运行不会使用更新后的工作流。
 
 首次使用需在仓库Settings → Secrets and variables → Actions → New repository secret添加下列四项：[GitHub官方说明](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets)。
 
-| Secret名称 | 内容 |
-| --- | --- |
+| Secret名称                    | 内容                             |
+| ----------------------------- | -------------------------------- |
 | `XMU_ANDROID_KEYSTORE_BASE64` | 正式签名keystore的单行Base64内容 |
-| `XMU_ANDROID_STORE_PASSWORD` | keystore密码 |
-| `XMU_ANDROID_KEY_ALIAS` | 正式签名密钥别名 |
-| `XMU_ANDROID_KEY_PASSWORD` | 该密钥密码 |
+| `XMU_ANDROID_STORE_PASSWORD`  | keystore密码                     |
+| `XMU_ANDROID_KEY_ALIAS`       | 正式签名密钥别名                 |
+| `XMU_ANDROID_KEY_PASSWORD`    | 该密钥密码                       |
 
 保持使用同一正式签名以便后续覆盖更新。Secrets不放进源码、issue或聊天；Base64只是编码。构建中仅在runner临时目录还原签名文件，结束后清理；缺失Secrets时明确失败，不回退调试签名。Pull Request不运行带密钥的正式构建。可在Actions中手动选择main运行工作流。
 

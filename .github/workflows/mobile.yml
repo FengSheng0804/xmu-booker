@@ -62,6 +62,8 @@ jobs:
   release-apk:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: [android, device-regression]
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +101,25 @@ jobs:
           path: release-artifacts/
           if-no-files-found: error
           retention-days: 90
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="$(python3 -c 'import pathlib,re; text=pathlib.Path("apps/mobile/pubspec.yaml").read_text(encoding="utf-8"); match=re.search(r"^version:\s*([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?\+[0-9]+)\s*$", text, re.M); assert match, "Invalid app version"; print(match.group(1))')"
+          tag="v${version/+/-build.}-${GITHUB_SHA:0:12}"
+          title="场馆预约助手 ${version}"
+          if gh release view "$tag" --json url >/dev/null 2>&1; then
+            tagged_sha="$(gh api "repos/$GH_REPO/commits/$tag" --jq '.sha')"
+            test "$tagged_sha" = "$GITHUB_SHA" || { echo 'Release tag points to another commit'; exit 1; }
+            gh release upload "$tag" release-artifacts/xmu-booker-arm64-release.apk release-artifacts/SHA256SUMS --clobber
+          else
+            gh release create "$tag" release-artifacts/xmu-booker-arm64-release.apk release-artifacts/SHA256SUMS \
+              --target "$GITHUB_SHA" --title "$title" --latest \
+              --notes "通过源码检查及 Android 11/15 设备回归的正式签名 ARM64 APK。提交：$GITHUB_SHA。下载 xmu-booker-arm64-release.apk 安装；SHA256SUMS 用于校验文件。"
+          fi
+          release_url="$(gh release view "$tag" --json url --jq '.url')"
+          printf '正式 APK 已发布：%s\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove temporary signing material
         if: always()
         run: python3 scripts/prepare-release-signing.py --clean
