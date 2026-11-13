@@ -276,7 +276,9 @@ class LocalEngineDeviceTest {
         val e = engine(w)
         e.setExecution(true)
         e.execute(t.id)
-        assertEquals("UNKNOWN", db.store().task(t.id).state)
+        // The school accepted the request before its response was lost; the immediate
+        // read-only reconciliation now confirms that order without waiting for a restart.
+        assertEquals("SUCCEEDED", db.store().task(t.id).state)
         val resumed = engine(w)
         resumed.execute(t.id)
         assertEquals(1, w.submits)
@@ -392,8 +394,12 @@ class LocalEngineDeviceTest {
         assertEquals("PENDING", db.store().task(t.id).state)
         db.store().claim(t.id, 2, "claim")
         db.store().recover(3)
+        assertEquals("PENDING", db.store().task(t.id).state)
+        db.store().claim(t.id, 4, "renewed-claim")
+        db.store().markSent(t.id, "{}", 5, "renewed-claim")
+        db.store().recover(6)
         assertEquals("UNKNOWN", db.store().task(t.id).state)
-        db.store().refreshUnsent("plan", day, "{}", 0, 0, 0, 4)
+        db.store().refreshUnsent("plan", day, "{}", 0, 0, 0, 7)
         assertEquals("UNKNOWN", db.store().task(t.id).state)
     }
 
@@ -612,7 +618,10 @@ class LocalEngineDeviceTest {
                     return reply
                 }
             }
-        val e = LocalEngine(context, db, { SchoolSession(record, wire) }, { "AB12" })
+        // Route reads through the synthetic session too; production read sessions use
+        // SchoolSession.openReadOnly and must never contact the school in this test.
+        val e = LocalEngine(context, db, { SchoolSession(record, wire) }, { "AB12" },
+            digest, "isolated_reconciliation_test_clear_${java.util.UUID.randomUUID()}")
         val pool = Executors.newSingleThreadExecutor()
         val reading =
             pool.submit<Boolean> {

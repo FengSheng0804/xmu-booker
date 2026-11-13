@@ -21,6 +21,8 @@ class _LocalHomePageState extends State<LocalHomePage>
   String? error;
   String? selectedCampus;
   int visibleOrders = 10, visibleMessages = 10;
+  final messageScroll = ScrollController();
+  final orderScroll = ScrollController();
   Timer? timer;
   static const titles = ['本机预约', '计划与任务', '学校订单', '本机设置'];
   @override
@@ -36,6 +38,8 @@ class _LocalHomePageState extends State<LocalHomePage>
   @override
   void dispose() {
     timer?.cancel();
+    messageScroll.dispose();
+    orderScroll.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -101,19 +105,6 @@ class _LocalHomePageState extends State<LocalHomePage>
       false;
   List<Json> rows(String key) => ((data?[key] as List?) ?? []).cast<Json>();
 
-  bool loadMore(ScrollNotification notification) {
-    if (notification.depth != 0 || notification is! ScrollUpdateNotification ||
-        (notification.scrollDelta ?? 0) <= 0 || notification.metrics.extentAfter > 100) {
-      return false;
-    }
-    if (tab == 2 && visibleOrders < rows('orders').length) {
-      setState(() => visibleOrders += 10);
-    } else if (tab == 0 && visibleMessages < rows('messages').length) {
-      setState(() => visibleMessages += 10);
-    }
-    return false;
-  }
-
   Widget pageHint(String kind, int visible, int total) => Padding(
       key: ValueKey('$kind-page-footer'), padding: const EdgeInsets.all(12),
       child: Text(visible < total ? '继续下滑加载更多${kind == 'orders' ? '订单' : '消息'}（已显示 $visible/$total）'
@@ -146,7 +137,9 @@ class _LocalHomePageState extends State<LocalHomePage>
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Text('${plan['name']}', style: Theme.of(c).textTheme.titleLarge),
           Text('${plan['venue']['stadium_name']} · ${planStatus(plan)}'),
-          Text('${plan['repeat'] == 'WEEKLY' ? '每周' : '入场日 ${plan['date']}'} · 执行 ${plan['execution_time']} 北京时间'),
+          Text(plan['execution_mode'] == 'MONITOR'
+            ? '入场日 ${plan['date']} · 每 ${plan['poll_seconds']} 秒检查\n${beijingMillis(plan['monitor_start_at'])} 至 ${beijingMillis(plan['monitor_end_at'])}'
+            : '${plan['repeat'] == 'WEEKLY' ? '每周' : '入场日 ${plan['date']}'} · 执行 ${plan['execution_time']} 北京时间'),
           for (final entry in (plan['weekdays'] as Map).entries)
             Text('星期${entry.key}：${(entry.value as List).join(' → ')}'),
           if (plan['last_result'] is Map)
@@ -189,7 +182,8 @@ class _LocalHomePageState extends State<LocalHomePage>
     final next = rows('tasks').where((t) => t['state'] == 'PENDING').toList()
       ..sort((a, b) => (a['run_at'] as num).compareTo(b['run_at'] as num));
     final ready = auth['has_token'] == true && data?['execution_enabled'] == true &&
-        permissions['notifications'] == true && permissions['exact_alarm'] == true;
+        permissions['notifications'] == true && permissions['exact_alarm'] == true &&
+        permissions['battery_unrestricted'] == true;
     return [
       card('所有预约都在这台手机运行', [
         const Text('无需项目账号、服务器。只有手机与学校系统通信，计划和授权留在本机。'),
@@ -214,7 +208,7 @@ class _LocalHomePageState extends State<LocalHomePage>
             color: ready ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.error),
           title: Text(!ready ? '需要完善执行条件' : next.isEmpty ? '暂无待执行计划' : '已安排自动执行'),
           subtitle: Text(!ready ? '请检查学校授权和后台权限' : next.isEmpty ? '创建计划后将自动启用' :
-            '${next.first['target']['stadium_name']}\n${beijingMillis(next.first['run_at'])}'),
+            '${next.first['target']['stadium_name']}\n${taskStateText(next.first)} · ${beijingMillis(next.first['target']['execution_mode'] == 'MONITOR' ? next.first['next_check_at'] : next.first['run_at'])}'),
         ),
         Wrap(spacing: 8, runSpacing: 4, children: [
           Chip(label: Text('待执行 ${next.length} 项')),
@@ -257,13 +251,23 @@ class _LocalHomePageState extends State<LocalHomePage>
               onTap: () => editor(null, venue)),
       ]),
       card('本地消息', [
-        if (rows('messages').isEmpty) const Text('暂无执行消息'),
-        for (final message in rows('messages').take(visibleMessages))
-          ListTile(
-              contentPadding: EdgeInsets.zero,
-              title: Text('${message['text']}'),
-              subtitle: Text(beijingMillis(message['created_at']))),
-        if (rows('messages').isNotEmpty) pageHint('messages', visibleMessages.clamp(0, rows('messages').length), rows('messages').length),
+        SizedBox(key: const ValueKey('local-messages-panel'), height: 280,
+          child: rows('messages').isEmpty ? const Center(child: Text('暂无执行消息')) :
+          NotificationListener<ScrollNotification>(onNotification: (notification) {
+            if (notification.depth == 0 && notification is ScrollUpdateNotification &&
+                (notification.scrollDelta ?? 0) > 0 && notification.metrics.extentAfter < 100 &&
+                visibleMessages < rows('messages').length) { setState(() => visibleMessages += 10); }
+            return true;
+          }, child: Scrollbar(controller: messageScroll, thumbVisibility: true,
+            child: ListView.builder(key: const ValueKey('local-messages-list'), controller: messageScroll,
+              primary: false, itemCount: visibleMessages.clamp(0, rows('messages').length) + 1,
+              itemBuilder: (context, index) {
+                if (index >= visibleMessages.clamp(0, rows('messages').length)) { return pageHint(
+                  'messages', visibleMessages.clamp(0, rows('messages').length), rows('messages').length); }
+                final message = rows('messages')[index];
+                return ListTile(contentPadding: const EdgeInsets.only(right: 12),
+                  title: Text('${message['text']}'), subtitle: Text(beijingMillis(message['created_at'])));
+              })))),
       ]),
     ];
   }
@@ -281,7 +285,7 @@ class _LocalHomePageState extends State<LocalHomePage>
           Card(key: ValueKey('plan-card-${p['id']}'), child: ListTile(
             title: Text('${p['name']}', maxLines: 1, overflow: TextOverflow.ellipsis),
             subtitle: Text('${p['venue']['stadium_name']}\n'
-                '${p['repeat'] == 'WEEKLY' ? '每周' : p['date']} · ${p['execution_time']} · '
+                '${p['repeat'] == 'WEEKLY' ? '每周' : p['date']} · ${p['execution_mode'] == 'MONITOR' ? '监控余量' : p['execution_time']} · '
                 '${planStatus(p).replaceAll('预约成功（学校订单已确认）', '预约成功').replaceAll('需要核对，禁止重发', '待核对')}',
                 maxLines: 3, overflow: TextOverflow.ellipsis),
             onTap: () => showPlan(p),
@@ -299,7 +303,7 @@ class _LocalHomePageState extends State<LocalHomePage>
         for (final t in rows('tasks'))
           Card(key: ValueKey('execution-record-${t['id']}'),
               child: ListTile(
-                  title: Text('${stateText(t['state'])} · ${t['date']}'),
+                  title: Text('${taskStateText(t)} · ${t['date']}'),
                   subtitle: Text(
                       '${t['target']['stadium_name']}\n${beijingMillis(t['run_at'])}\n${executionReason(t['reason'])}'),
                   isThreeLine: true,
@@ -343,7 +347,7 @@ class _LocalHomePageState extends State<LocalHomePage>
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Text(stateText(task['state']),
+                      Text(taskStateText(task),
                           style: Theme.of(c).textTheme.titleLarge),
                       Text('入场日 ${task['date']}'),
                       Text('${task['target']['stadium_name']}'),
@@ -351,6 +355,8 @@ class _LocalHomePageState extends State<LocalHomePage>
                           '候选：${(task['target']['ranges'] as List).join(' → ')}'),
                       Text('执行：${beijingMillis(task['run_at'])}'),
                       Text('截止：${beijingMillis(task['deadline'])}'),
+                      if (task['target']['execution_mode'] == 'MONITOR')
+                        Text('检查间隔：${task['target']['poll_seconds']} 秒 · 下次检查：${beijingMillis(task['next_check_at'])}'),
                       Text(executionReason(task['reason'])),
                       if (task['state'] == 'SUCCEEDED') TextButton(onPressed: () {
                         Navigator.pop(c); setState(() => tab = 2);
@@ -405,20 +411,33 @@ class _LocalHomePageState extends State<LocalHomePage>
                 ? null
                 : () => action(() async {
                       await api.syncOrders();
+                      visibleOrders = 10;
+                      if (orderScroll.hasClients) orderScroll.jumpTo(0);
                     }),
             child: const Text('从学校同步本人订单')),
         Text('最近同步：${beijingMillis(data?['orders_updated_at'])}'),
         const Text('以下为本机缓存，需同步取得当前状态。取消预约或学校自身的缴费事项，请前往学校原入口处理。'),
-        if (rows('orders').isEmpty)
-          const Padding(
-              padding: EdgeInsets.all(24), child: Text('尚未同步订单，或学校未返回本人订单。')),
-        for (final order in rows('orders').take(visibleOrders))
-          Card(key: ValueKey('order-${order['order_id']}'), child: ListTile(
+        SizedBox(key: const ValueKey('school-orders-panel'),
+          child: rows('orders').isEmpty
+            ? const Center(child: Text('尚未同步订单，或学校未返回本人订单。'))
+            : NotificationListener<ScrollNotification>(onNotification: (notification) {
+                if (notification.depth == 0 && notification is ScrollUpdateNotification &&
+                    (notification.scrollDelta ?? 0) > 0 && notification.metrics.extentAfter < 100 &&
+                    visibleOrders < rows('orders').length) { setState(() => visibleOrders += 10); }
+                return true;
+              }, child: Scrollbar(controller: orderScroll, thumbVisibility: true,
+                child: ListView.builder(key: const ValueKey('school-orders-list'), controller: orderScroll,
+                  primary: false, itemCount: visibleOrders.clamp(0, rows('orders').length) + 1,
+                  itemBuilder: (context, index) {
+                    if (index >= visibleOrders.clamp(0, rows('orders').length)) { return pageHint(
+                      'orders', visibleOrders.clamp(0, rows('orders').length), rows('orders').length); }
+                    final order = rows('orders')[index];
+                    return Card(key: ValueKey('order-${order['order_id']}'), child: ListTile(
             title: Text('${order['stadium_name'] ?? '学校预约'} · ${order['audit_status_text'] ?? '查看详情'}'),
             subtitle: Text([for (final d in ((order['detail'] as List?) ?? []).cast<Map>())
               '${d['date']} ${d['interval_time']} · ${d['status_text'] ?? ''}'].join('\n'), maxLines: 2, overflow: TextOverflow.ellipsis),
-            trailing: const Icon(Icons.chevron_right), onTap: () => showOrder(order))),
-        if (rows('orders').isNotEmpty) pageHint('orders', visibleOrders.clamp(0, rows('orders').length), rows('orders').length),
+            trailing: const Icon(Icons.chevron_right), onTap: () => showOrder(order)));
+                  })))),
       ];
   void showOrder(Json order) {
     showModalBottomSheet<void>(context: context, isScrollControlled: true,
@@ -448,6 +467,9 @@ class _LocalHomePageState extends State<LocalHomePage>
               trailing: const Icon(Icons.open_in_new),
               onTap: busy ? null : () => action(() => api.settings(kind))),
         Text(permissions['keep_alive_active'] == true ? '后台守护运行中，通知栏可查看。' : '有待执行计划且权限齐全时，自动启动后台守护。'),
+        ListTile(contentPadding: EdgeInsets.zero, title: const Text('后台运行与自启动'),
+          subtitle: const Text('华为/荣耀请在应用启动管理中允许自启动、关联启动和后台活动；可在最近任务中锁定App。'),
+          trailing: const Icon(Icons.open_in_new), onTap: busy ? null : () => action(() => api.settings('app'))),
         const Text('请在手机系统中允许后台运行与自启动。系统强制停止后需重新打开恢复。'),
       ]),
       card('存储管理', [
@@ -526,13 +548,21 @@ class _LocalHomePageState extends State<LocalHomePage>
                         : const Text('无法读取本机状态，请重试'))
                 : RefreshIndicator(
                     onRefresh: refresh,
-                    child: NotificationListener<ScrollNotification>(onNotification: loadMore,
-                      child: Builder(builder: (_) {
+                    child: Builder(builder: (_) {
+                        if (tab == 2) {
+                          final children = orders();
+                          return CustomScrollView(key: const PageStorageKey('local-tab-2'), slivers: [
+                            SliverPadding(padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                              sliver: SliverList.list(children: children.sublist(0, children.length - 1))),
+                            SliverPadding(padding: const EdgeInsets.symmetric(horizontal: 16),
+                              sliver: SliverFillRemaining(hasScrollBody: true, child: children.last)),
+                          ]);
+                        }
                         final children = [...[home, plans, orders, settings][tab](), const SizedBox(height: 24)];
                         return ListView.builder(key: PageStorageKey('local-tab-$tab'),
                           padding: const EdgeInsets.all(16), itemCount: children.length,
                           itemBuilder: (_, index) => children[index]);
-                      })))),
+                      }))),
       ])),
       bottomNavigationBar: NavigationBar(
           selectedIndex: tab,

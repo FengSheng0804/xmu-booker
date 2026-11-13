@@ -94,6 +94,7 @@ internal constructor(
         }
 
         fun executionWindow(p: JSONObject, day: LocalDate): Pair<Long, Long> {
+            if (MonitorRules.enabled(p)) return MonitorRules.window(p).let { Pair(it[0], it[1]) }
             val run =
                 day.minusDays(p.getLong("days_before"))
                     .atTime(LocalTime.parse(p.getString("execution_time")))
@@ -138,6 +139,7 @@ internal constructor(
                 .put("state", t.state)
                 .put("reason", t.reason)
                 .put("run_at", t.runAt)
+                .put("next_check_at", t.prepareAt)
                 .put("deadline", t.deadline)
     }
 
@@ -423,12 +425,21 @@ internal constructor(
             }
 
             if (stadiumList != null && stadiumList.length() > 0) {
+                val detailsByIndex = ReadBatch.run((0 until stadiumList.length()).map { index ->
+                    java.util.concurrent.Callable {
+                        try {
+                            (if (isolated) readSession() else session.forkReadOnly()).use {
+                                it.stadiumDetails(stadiumList.getJSONObject(index).getString("id"))
+                            }
+                        } catch (_: Exception) { null }
+                    }
+                })
                 for (i in 0 until stadiumList.length()) {
                     val st = stadiumList.getJSONObject(i)
                     val sId = st.optString("id")
                     val sName = st.optString("name")
                     try {
-                        val details = session.stadiumDetails(sId)
+                        val details = detailsByIndex[i] ?: error("CATALOG_DETAILS_UNAVAILABLE")
                         val venues = details.optJSONArray("venue")
                         if (venues != null && venues.length() > 0) {
                             for (j in 0 until venues.length()) {
@@ -461,10 +472,11 @@ internal constructor(
 
             val result = JSONArray()
             val merged = mergeCatalog(JSONArray(targets), defaultVenuesArray())
-            for (i in 0 until merged.length()) {
-                val target = merged.getJSONObject(i)
+            val inventories = ReadBatch.run((0 until merged.length()).map { index ->
+                java.util.concurrent.Callable {
+                val target = merged.getJSONObject(index)
                 val inventory = try {
-                    session.inventoryForQuery(target)
+                    (if (isolated) readSession() else session.forkReadOnly()).use { it.inventoryForQuery(target) }
                 } catch (e: Exception) {
                     JSONObject()
                         .put("is_can_choose", 0)
@@ -472,8 +484,10 @@ internal constructor(
                         .put("time_slot_list", JSONArray())
                 }
                 val resolved = inventory.optJSONObject("resolved_target") ?: target
-                result.put(JSONObject(resolved.toString()).put("inventory", inventory))
-            }
+                JSONObject(resolved.toString()).put("inventory", inventory)
+                }
+            })
+            for (inventory in inventories) result.put(inventory)
             cacheCurrent("venues", result, owner, epoch)
             result
         }
@@ -484,6 +498,7 @@ internal constructor(
     }
 
     fun validate(plan: JSONObject) {
+        require(plan.optString("execution_mode", "TIMED") in setOf("TIMED", "MONITOR")) { "INVALID_PLAN" }
         require(plan.getString("name").length in 1..80) { "INVALID_PLAN" }
         SchoolSession.targetFields(plan.getJSONObject("venue"))
         require(
@@ -494,6 +509,12 @@ internal constructor(
         }
         require(plan.getString("repeat") in setOf("ONCE", "WEEKLY")) { "INVALID_PLAN" }
         LocalDate.parse(plan.getString("date"))
+        if (MonitorRules.enabled(plan)) {
+            val span = MonitorRules.window(plan)
+            require(plan.getString("repeat") == "ONCE" &&
+                span[1] <= LocalDate.parse(plan.getString("date")).plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli() &&
+                (!plan.optBoolean("enabled") || span[1] > System.currentTimeMillis())) { "MONITOR_WINDOW_INVALID" }
+        }
         LocalTime.parse(plan.getString("release_time"))
         LocalTime.parse(plan.getString("execution_time"))
         require(
@@ -610,6 +631,8 @@ internal constructor(
                         .put("ranges", ranges)
                         .put("priority", p.getInt("priority"))
                         .put("owner_digest", p.getString("owner_digest"))
+                        .put("execution_mode", p.optString("execution_mode", "TIMED"))
+                        .put("poll_seconds", if (MonitorRules.enabled(p)) MonitorRules.interval(p) else 0)
                 val task =
                     LocalDatabase.Task().apply {
                         id = UUID.nameUUIDFromBytes((plan.id + ":" + day).toByteArray()).toString()
@@ -618,9 +641,11 @@ internal constructor(
                         this.target = target.toString()
                         runAt = window.first
                         deadline = window.second
-                        prepareAt = runAt - p.getLong("prepare_lead_seconds") * 1000
+                        prepareAt = if (MonitorRules.enabled(p)) maxOf(runAt, System.currentTimeMillis())
+                            else runAt - p.getLong("prepare_lead_seconds") * 1000
                         updatedAt = System.currentTimeMillis()
                     }
+                if (MonitorRules.enabled(p) && dao.task(task.id)?.state == "PENDING") continue
                 if (dao.addTask(task) == -1L)
                     dao.refreshUnsent(
                         plan.id,
@@ -688,6 +713,32 @@ internal constructor(
             it.id != task.id && sameBookingScope(JSONObject(it.target), JSONObject(task.target))
         }
 
+    @Synchronized
+    internal fun activeMonitor(): Boolean = enabled && dao.activeUnsent().any {
+        it.state in setOf("PENDING", "CLAIMED") && MonitorRules.enabled(JSONObject(it.target)) &&
+            System.currentTimeMillis() >= it.runAt && System.currentTimeMillis() < it.deadline &&
+            dao.plan(it.planId)?.enabled == true
+    }
+
+    @Synchronized
+    private fun deferMonitor(task: LocalDatabase.Task, claim: String, cause: String, transientError: Boolean = false): Boolean {
+        val current = dao.task(task.id) ?: return false
+        val now = System.currentTimeMillis()
+        if (!enabled || dao.plan(task.planId)?.enabled != true || now >= task.deadline ||
+            current.state != "CLAIMED" || current.receipt != claim) return false
+        val before = JSONObject(claim).optJSONObject("monitor") ?: JSONObject()
+        val errors = if (transientError) before.optInt("consecutive_errors") + 1 else 0
+        val monitor = JSONObject().put("polls", before.optInt("polls") + 1)
+            .put("last_checked_at", now).put("consecutive_errors", errors)
+        val next = MonitorRules.nextPoll(now, task.deadline, MonitorRules.interval(JSONObject(task.target)), errors)
+        monitor.put("next_check_at", next)
+        val receipt = JSONObject().put("monitor", monitor)
+        val deferred = dao.deferMonitor(task.id, claim, next, receipt.toString(),
+            if (transientError) "监控暂缓：$cause，稍后继续检查" else "监控中：暂无可预约名额，等待下一次检查", now) == 1
+        if (deferred) schedule()
+        return deferred
+    }
+
     /** Run on one worker thread. Waiting does not hold the mutation lock so the user can pause. */
     fun execute(id: String) {
         val task = synchronized(this) { dao.task(id) ?: return }
@@ -696,22 +747,47 @@ internal constructor(
             return
         }
         if (task.state != "PENDING") return
-        val claim = JSONObject().put("claim", UUID.randomUUID().toString()).toString()
+        if (task.prepareAt > System.currentTimeMillis() + 1000) return
+        val monitoring = MonitorRules.enabled(JSONObject(task.target))
+        val claim = JSONObject().put("claim", UUID.randomUUID().toString()).also {
+            if (monitoring) JSONObject(task.receipt).optJSONObject("monitor")?.let { previous -> it.put("monitor", previous) }
+        }.toString()
         synchronized(this) {
             if (!enabled) return
             if (System.currentTimeMillis() >= task.deadline) {
-                finish(task, "EXPIRED", "已超过执行窗口")
+                finish(task, "EXPIRED", if (monitoring) "监控已结束，未预约到名额" else "已超过执行窗口")
                 return
             }
             if (dao.claim(id, System.currentTimeMillis(), claim) != 1) return
             task.receipt = claim
         }
         var sent = false
+        var phase = "CHECK_PLAN"
         try {
             stillAllowed(task)
+            schedule() // Arm recovery before any slow school request, even after a cold alarm wake.
+            if (monitoring) {
+                check(blockingTasks(task).isEmpty()) { "PENDING_RECONCILIATION" }
+                phase = "READ_INVENTORY"
+                val available = readSession().use { school ->
+                    val target = JSONObject(task.target)
+                    val inventory = school.inventory(target)
+                    val ranges = target.getJSONArray("ranges")
+                    (0 until ranges.length()).any {
+                        try { SchoolSession.select(inventory, target, ranges.getString(it)); true }
+                        catch (error: Exception) {
+                            if (error.message in setOf("NO_AVAILABLE_TARGET", "VENUE_UNAVAILABLE")) false else throw error
+                        }
+                    }
+                }
+                if (!available && deferMonitor(task, claim, "NO_AVAILABLE_TARGET")) return
+                stillAllowed(task)
+            }
+            phase = "VERIFY_AUTHORIZATION"
             sessions().use { school ->
                 val target = JSONObject(task.target)
                 val ranges = target.getJSONArray("ranges")
+                phase = "READ_BASELINE_ORDERS"
                 val baseline = school.orders(true)
                 // Unknown same-venue/day receipts are a barrier even for a newly copied plan.
                 check(
@@ -735,6 +811,7 @@ internal constructor(
                         return
                     }
                 }
+                phase = "WAIT_EXECUTION"
                 while (System.currentTimeMillis() < task.runAt) {
                     stillAllowed(task)
                     Thread.sleep(
@@ -742,7 +819,9 @@ internal constructor(
                     )
                 }
                 stillAllowed(task)
+                phase = "READ_INVENTORY"
                 val inventory = school.inventory(target)
+                phase = "SELECT_SLOT"
                 var detail: JSONObject? = null
                 var range = ""
                 for (i in 0 until ranges.length()) try {
@@ -752,11 +831,15 @@ internal constructor(
                 } catch (e: Exception) {
                     if (e.message != "NO_AVAILABLE_TARGET") throw e
                 }
+                if (detail == null && monitoring && deferMonitor(task, claim, "NO_AVAILABLE_TARGET")) return
                 check(detail != null) { "NO_AVAILABLE_TARGET" }
                 val selected = detail
                 val prepareStarted = System.currentTimeMillis()
+                phase = "PREPARE_BOOKING"
                 val image = school.prepare(target, selected)
+                phase = "RECOGNIZE_CAPTCHA"
                 val prediction = predictor(image)
+                phase = "WAIT_SUBMISSION"
                 // Official manual bookings took 5.7-7.1 s between the confirm page and addOrder;
                 // every machine-speed submit was refused. Keep a human-scale gap before sending.
                 while (System.currentTimeMillis() - prepareStarted < MIN_CONFIRM_TO_SUBMIT_MS) {
@@ -781,6 +864,7 @@ internal constructor(
                                 }
                             ),
                         )
+                phase = "SUBMIT_BOOKING"
                 school.submit(target, selected, prediction) {
                     synchronized(this) {
                         stillAllowed(task)
@@ -800,25 +884,39 @@ internal constructor(
                 }
                 task.state = "SENT"
             }
+            phase = "CHECK_RESULT"
             reconcile(task)
         } catch (e: Exception) {
+            if (monitoring && !sent && System.currentTimeMillis() >= task.deadline) {
+                synchronized(this) {
+                    val current = dao.task(id)
+                    if (current?.state == "CLAIMED" && current.receipt == claim)
+                        finish(task, "EXPIRED", "监控已结束，未预约到名额")
+                }
+                return
+            }
+            if (monitoring && !sent && ExecutionFailure.code(e) in setOf(
+                "NETWORK_TIMEOUT", "NETWORK_UNAVAILABLE", "SCHOOL_HTTP_FAILED", "READ_CHECK_HTTP_FAILED", "NO_AVAILABLE_TARGET", "VENUE_UNAVAILABLE")) {
+                val transient = ExecutionFailure.code(e) !in setOf("NO_AVAILABLE_TARGET", "VENUE_UNAVAILABLE")
+                if (deferMonitor(task, claim, ExecutionFailure.description(e, phase), transient)) return
+            }
             synchronized(this) {
                 val current = dao.task(id) ?: return
                 if (!sent && (current.state != "CLAIMED" || current.receipt != claim)) return
                 val rejection = (e as? SchoolSession.RejectedException)?.description()
                     ?: (e as? com.example.xmu_sports_booking.capture.SportsProtocol.ReadRejectedException)?.description()
+                val failure = ExecutionFailure.diagnostic(e, phase).put("at", System.currentTimeMillis())
+                val receipt = JSONObject(current.receipt).put("failure", failure)
                 if (sent) {
                     finish(task, "UNKNOWN", "提交结果待核对，禁止自动重发" +
-                        (rejection?.let { "。$it" } ?: ""))
+                        (rejection?.let { "。$it" } ?: "。${ExecutionFailure.description(e, phase)}"), receipt)
                 } else {
-                    val code =
-                        e.message?.takeIf { it.matches(Regex("[A-Z_]{3,64}")) }
-                            ?: "LOCAL_OPERATION_FAILED"
                     val stopped = dao.plan(task.planId)?.enabled != true || !enabled
                     finish(
                         task,
                         if (stopped) "CANCELLED" else "FAILED",
-                        if (stopped) "计划已暂停" else "预约未完成：${rejection ?: code}",
+                        if (stopped) "计划已暂停" else "预约未完成：${rejection ?: ExecutionFailure.description(e, phase)}",
+                        receipt,
                     )
                 }
             }

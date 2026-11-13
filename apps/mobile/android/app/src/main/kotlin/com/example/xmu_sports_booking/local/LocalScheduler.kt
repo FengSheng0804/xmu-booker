@@ -74,17 +74,25 @@ object LocalScheduler {
                 Intent(context, LocalAlarmReceiver::class.java).setAction("LOCAL_BOOKING_ALARM"),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
-        alarm.cancel(pending)
-        LocalKeepAliveService.sync(context, engine.enabled && notifications(context) &&
-            exact(context) && engine.db.store().next() != null)
-        if (!engine.enabled || !exact(context) || !notifications(context)) return
-        val next = engine.db.store().next() ?: return
+        val recovery = if (engine.enabled && notifications(context)) engine.db.store().recoveryNext() else null
+        LocalKeepAliveService.sync(context, recovery != null)
+        LocalRecoveryJob.schedule(context, recovery)
+        val next = if (recovery != null) engine.db.store().next() ?: recovery else null
+        if (next == null) { alarm.cancel(pending); return }
+        val now = System.currentTimeMillis()
+        val alarmAt = when (next.state) {
+            "CLAIMED" -> maxOf(now + 15_000L, next.prepareAt)
+            "SENT" -> maxOf(now + 60_000L, next.prepareAt)
+            else -> maxOf(now + 1000L, next.prepareAt)
+        }
         // One exact wake starts the preparation window; no second alarm inside Doze is needed.
-        alarm.setExactAndAllowWhileIdle(
+        if (exact(context)) alarm.setExactAndAllowWhileIdle(
             AlarmManager.RTC_WAKEUP,
-            maxOf(System.currentTimeMillis() + 1000, next.prepareAt),
+            alarmAt,
             pending,
         )
+        else alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,
+            alarmAt, pending)
     }
 
     fun start(context: Context, id: String? = null) {
@@ -149,6 +157,7 @@ class LocalBookingService : Service() {
             val engine = LocalEngine.get(this)
             try {
                 engine.initialize()
+                engine.requestReconciliation()
                 val requested = intent?.getStringExtra("task_id")
                 if (requested != null) engine.execute(requested)
                 else {
@@ -168,7 +177,12 @@ class LocalBookingService : Service() {
                 stopSelfResult(startId)
             }
         }
-        return START_NOT_STICKY
+        return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        executor.execute { LocalScheduler.schedule(this) }
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {

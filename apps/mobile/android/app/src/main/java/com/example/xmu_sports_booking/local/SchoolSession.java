@@ -35,11 +35,16 @@ public final class SchoolSession implements AutoCloseable {
   private String cookie = "", referer;
   private boolean readOnly;
   private JSONArray firstOrders;
-  private final Map<String, JSONObject> stadiumDetailsCache = new HashMap<>();
+  private Map<String, JSONObject> stadiumDetailsCache = new java.util.concurrent.ConcurrentHashMap<>();
+  private Map<String, JSONObject> ownedOrders = new java.util.concurrent.ConcurrentHashMap<>();
   private static final ReadSessionCache<SportsProtocol.VerifiedSession> readSessions = new ReadSessionCache<>(60_000);
+  private static Map<String, JSONObject> readDetails = new java.util.concurrent.ConcurrentHashMap<>();
+  private static Map<String, JSONObject> readOwnedOrders = new java.util.concurrent.ConcurrentHashMap<>();
 
   private static synchronized void invalidateReadSession() {
     readSessions.clear();
+    readDetails = new java.util.concurrent.ConcurrentHashMap<>();
+    readOwnedOrders = new java.util.concurrent.ConcurrentHashMap<>();
   }
 
   public interface Wire {
@@ -138,6 +143,8 @@ public final class SchoolSession implements AutoCloseable {
     SportsProtocol.VerifiedSession readSession = readSessions.get(saved, now);
     boolean fresh = readSession == null;
     if (fresh) {
+      readDetails = new java.util.concurrent.ConcurrentHashMap<>();
+      readOwnedOrders = new java.util.concurrent.ConcurrentHashMap<>();
       JSONObject fields = new JSONObject(saved).getJSONObject("fields");
       SportsProtocol.VerifiedSession verified = SportsProtocol.verifySession(
           encode(map(fields)), fields.getString("student_num"), stage -> {});
@@ -151,6 +158,19 @@ public final class SchoolSession implements AutoCloseable {
     SchoolSession result = new SchoolSession(readSession.record, new HttpWire(), readSession.session,
         fresh ? readSession.firstOrders : null, true);
     result.readOnly = true;
+    result.stadiumDetailsCache = readDetails;
+    result.ownedOrders = readOwnedOrders;
+    return result;
+  }
+
+  /** Independent transport, same short verified read lease; never available to submission sessions. */
+  public SchoolSession forkReadOnly() throws Exception {
+    require(readOnly, "READ_ROUTE_REFUSED");
+    SchoolSession result = new SchoolSession(new JSONObject().put("fields", new JSONObject(fields)),
+        wire instanceof HttpWire ? new HttpWire() : wire, cookie, null, true);
+    result.readOnly = true;
+    result.stadiumDetailsCache = stadiumDetailsCache;
+    result.ownedOrders = ownedOrders;
     return result;
   }
 
@@ -255,20 +275,43 @@ public final class SchoolSession implements AutoCloseable {
     return orders(expand, null);
   }
 
+  private static final class OrderPage {
+    JSONArray rows;
+    Exception error;
+    OrderPage(JSONArray rows, Exception error) { this.rows = rows; this.error = error; }
+    JSONArray value() throws Exception { if (error != null) throw error; return rows; }
+  }
+
+  private OrderPage orderPage(int page) {
+    try (SchoolSession s = forkReadOnly()) {
+      return new OrderPage(s.read("/index/stadium/mySubscribe", Map.of("p", Integer.toString(page))).getJSONArray("data"), null);
+    } catch (Exception e) { return new OrderPage(null, e); }
+  }
+
   private JSONArray orders(boolean expand, String stopAtOrder) throws Exception {
     JSONArray result = new JSONArray();
     Set<String> seen = new HashSet<>();
     boolean restarted = false;
+    Map<Integer, OrderPage> pages = new HashMap<>();
     for (int read = 0, page = 1; read < 100; read++, page++) {
       JSONArray rows;
       if (page == 1 && firstOrders != null) { rows = firstOrders; firstOrders = null; }
-      else rows = read("/index/stadium/mySubscribe", Map.of("p", Integer.toString(page))).getJSONArray("data");
+      else if (readOnly && !expand && stopAtOrder == null && page > 1) {
+        if (!pages.containsKey(page)) {
+          final int first = page;
+          List<OrderPage> batch = ReadBatch.run(Arrays.asList(
+              () -> orderPage(first), () -> orderPage(first + 1)));
+          pages.put(page, batch.get(0)); pages.put(page + 1, batch.get(1));
+        }
+        rows = pages.remove(page).value();
+      } else rows = read("/index/stadium/mySubscribe", Map.of("p", Integer.toString(page))).getJSONArray("data");
       boolean overlap = false;
       for (int i = 0; i < rows.length(); i++) {
         JSONObject row = rows.getJSONObject(i);
         require(fields.get("uid").equals(row.optString("uid")), "OWNER_MISMATCH");
         String id = row.optString("order_id");
         require(!id.isEmpty() && id.length() <= 256, "ORDER_ID_INVALID");
+        if (readOnly) ownedOrders.put(id, new JSONObject(row.toString()));
         if (!seen.add(id)) {
           overlap = true;
           break;
@@ -310,6 +353,7 @@ public final class SchoolSession implements AutoCloseable {
         require(!restarted, "INCOMPLETE_ORDER_SCAN");
         result = new JSONArray();
         seen.clear();
+        pages.clear();
         page = 0;
         restarted = true;
         continue;
@@ -625,13 +669,15 @@ public final class SchoolSession implements AutoCloseable {
     return entryPasses(detail, target, receipt);
   }
 
-  /** Resolve only an order found in a fresh, owner-verified school order list. */
+  /** Use owner-verified list membership within the 60-second lease; always refresh QR/status details. */
   public JSONObject orderEntryPass(String id) throws Exception {
     require(id != null && !id.isBlank() && id.length() <= 128, "ENTRY_PASS_UNAVAILABLE");
-    JSONArray orders = orders(false, id);
-    JSONObject owned = null;
-    for (int i = 0; i < orders.length(); i++)
-      if (id.equals(orders.getJSONObject(i).optString("order_id"))) owned = orders.getJSONObject(i);
+    JSONObject owned = readOnly ? ownedOrders.get(id) : null;
+    if (owned == null) {
+      JSONArray orders = orders(false, id);
+      for (int i = 0; i < orders.length(); i++)
+        if (id.equals(orders.getJSONObject(i).optString("order_id"))) owned = orders.getJSONObject(i);
+    }
     require(owned != null && fields.get("uid").equals(owned.optString("uid")), "OWNER_MISMATCH");
     JSONObject detail = read("/index/stadium/orderDetails", Map.of("order_id", id, "order_num", ""))
         .getJSONObject("data");

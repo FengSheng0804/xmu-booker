@@ -11,6 +11,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - run: python3 -m unittest discover -s scripts/tests -v
       - name: Install pinned Flutter
         run: |
           git clone --depth 1 --branch 3.47.8 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
@@ -21,14 +22,8 @@ jobs:
         working-directory: apps/mobile
       - run: flutter test
         working-directory: apps/mobile
-      - run: flutter build apk --debug --flavor production --target-platform android-arm64
-        working-directory: apps/mobile
       - run: chmod +x gradlew && ./gradlew :app:testProductionDebugUnitTest --console=plain
         working-directory: apps/mobile/android
-      - uses: actions/upload-artifact@v4
-        with:
-          name: independent-android-debug
-          path: apps/mobile/build/app/outputs/flutter-apk/app-production-debug.apk
   device-regression:
     runs-on: ubuntu-latest
     strategy:
@@ -64,3 +59,46 @@ jobs:
         with:
           name: device-results-api-${{ matrix.api }}
           path: apps/mobile/build/app/outputs/androidTest-results/
+  release-apk:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [android, device-regression]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install pinned Flutter
+        run: |
+          git clone --depth 1 --branch 3.47.8 https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - run: flutter pub get
+        working-directory: apps/mobile
+      - name: Prepare private release signing
+        env:
+          XMU_ANDROID_KEYSTORE_BASE64: ${{ secrets.XMU_ANDROID_KEYSTORE_BASE64 }}
+          XMU_ANDROID_STORE_PASSWORD: ${{ secrets.XMU_ANDROID_STORE_PASSWORD }}
+          XMU_ANDROID_KEY_ALIAS: ${{ secrets.XMU_ANDROID_KEY_ALIAS }}
+          XMU_ANDROID_KEY_PASSWORD: ${{ secrets.XMU_ANDROID_KEY_PASSWORD }}
+        run: python3 scripts/prepare-release-signing.py
+      - name: Build signed release APK
+        working-directory: apps/mobile
+        run: flutter build apk --release --flavor production --target-platform android-arm64 --split-per-abi
+      - name: Name and verify release artifact
+        run: |
+          mkdir -p release-artifacts
+          cp apps/mobile/build/app/outputs/flutter-apk/app-arm64-v8a-production-release.apk release-artifacts/xmu-booker-arm64-release.apk
+          signer="$(find "$ANDROID_HOME/build-tools" -mindepth 2 -maxdepth 2 -name apksigner | sort -V | tail -n 1)"
+          "$signer" verify --verbose release-artifacts/xmu-booker-arm64-release.apk
+          cd release-artifacts
+          sha256sum xmu-booker-arm64-release.apk > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xmu-booker-arm64-release
+          path: release-artifacts/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove temporary signing material
+        if: always()
+        run: python3 scripts/prepare-release-signing.py --clean

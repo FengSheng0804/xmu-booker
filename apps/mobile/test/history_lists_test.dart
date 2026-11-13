@@ -38,43 +38,56 @@ void main() {
     await tester.pumpAndSettle();
   }
 
-  Future<void> scrollPage(WidgetTester tester) async {
-    final element = tester.element(find.byType(ListView));
-    ScrollUpdateNotification(metrics: FixedScrollMetrics(minScrollExtent: 0, maxScrollExtent: 1000,
-      pixels: 1000, viewportDimension: 500, axisDirection: AxisDirection.down, devicePixelRatio: 1),
-      context: element, scrollDelta: 100).dispatch(element);
-    await tester.pumpAndSettle();
-  }
-
-  testWidgets('orders show ten at first and add ten only after scrolling', (tester) async {
+  testWidgets('orders fill remaining viewport and show ten before scrolling inside the panel', (tester) async {
     home['orders'] = List.generate(25, (i) => {'order_id': '$i', 'stadium_name': '订单 $i', 'detail': []});
-    await open(tester);
+    await open(tester, height: 800);
     await tester.tap(find.text('订单').last);
     await tester.pumpAndSettle();
-    int count() => tester.widget<ListView>(find.byType(ListView)).childrenDelegate.estimatedChildCount!;
+    final list = find.byKey(const ValueKey('school-orders-list'));
+    final panel = find.byKey(const ValueKey('school-orders-panel'));
+    int count() => tester.widget<ListView>(list).childrenDelegate.estimatedChildCount!;
     final initial = count();
+    expect(initial, 11);
+    final height = tester.getSize(panel).height;
+    expect(height, greaterThan(280));
+    expect(tester.getBottomLeft(panel).dy, closeTo(tester.getTopLeft(find.byType(NavigationBar)).dy, 1));
+    final outerScroll = tester.state<ScrollableState>(find.descendant(
+      of: find.byType(CustomScrollView), matching: find.byType(Scrollable)).first);
+    final before = outerScroll.position.pixels;
     await tester.pump(const Duration(seconds: 6));
     expect(count(), initial);
-    await scrollPage(tester);
+    await tester.drag(list, const Offset(0, -1000)); await tester.pumpAndSettle();
     expect(count(), initial + 10);
-    await scrollPage(tester);
+    await tester.drag(list, const Offset(0, -1400)); await tester.pumpAndSettle();
     expect(count(), initial + 15);
-    await scrollPage(tester);
+    await tester.drag(list, const Offset(0, -1400)); await tester.pumpAndSettle();
     expect(count(), initial + 15);
+    expect(tester.getSize(panel).height, height);
+    expect(outerScroll.position.pixels, before);
     expect(calls.where((c) => c.method == 'syncOrders'), isEmpty);
+    tester.view.physicalSize = const Size(600,1000);
+    await tester.pumpAndSettle();
+    expect(tester.getSize(panel).height, closeTo(height + 200, 1));
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
-  testWidgets('local messages use the same ten-item scroll batches', (tester) async {
+  testWidgets('local messages keep a fixed height and load more inside their own scroll area', (tester) async {
     home['messages'] = List.generate(25, (i) => {'id': '$i', 'text': '测试消息 $i', 'created_at': 1});
     await open(tester);
-    expect(find.text('测试消息 9'), findsOneWidget);
-    expect(find.text('测试消息 10'), findsNothing);
-    await scrollPage(tester);
-    expect(find.text('测试消息 19'), findsOneWidget);
-    expect(find.text('测试消息 20'), findsNothing);
-    await scrollPage(tester);
-    expect(find.text('测试消息 24'), findsOneWidget);
+    final panel = find.byKey(const ValueKey('local-messages-panel'));
+    final list = find.byKey(const ValueKey('local-messages-list'));
+    expect(tester.getSize(panel).height, 280);
+    int count() => tester.widget<ListView>(list).childrenDelegate.estimatedChildCount!;
+    expect(count(), 11);
+    final outer = find.byType(ListView).first;
+    final outerScroll = tester.state<ScrollableState>(find.descendant(of: outer, matching: find.byType(Scrollable)).first);
+    final before = outerScroll.position.pixels;
+    await tester.drag(list, const Offset(0, -800)); await tester.pumpAndSettle();
+    expect(count(), 21);
+    await tester.drag(list, const Offset(0, -1200)); await tester.pumpAndSettle();
+    expect(count(), 26);
+    expect(tester.getSize(panel).height, 280);
+    expect(outerScroll.position.pixels, before);
     await tester.pumpWidget(const SizedBox.shrink());
   });
 

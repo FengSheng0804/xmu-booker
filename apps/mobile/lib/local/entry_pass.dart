@@ -18,6 +18,20 @@ class _EntryPassViewState extends State<EntryPassView> {
     result = const LocalApi().orderEntryPass(widget.orderId);
   }
 
+  void enlarge(Json pass) {
+    Navigator.of(context).push(MaterialPageRoute<void>(fullscreenDialog: true,
+      builder: (context) => Scaffold(
+        appBar: AppBar(),
+        body: SafeArea(child: Center(child: Padding(padding: const EdgeInsets.all(16),
+          child: LayoutBuilder(builder: (context, bounds) {
+            final size = bounds.maxWidth < bounds.maxHeight ? bounds.maxWidth : bounds.maxHeight;
+            return QrImageView(key: const ValueKey('fullscreen-entry-qr'), data: '${pass['payload']}',
+              version: QrVersions.auto, size: size, padding: EdgeInsets.all(size * 0.08),
+              backgroundColor: Colors.white, errorCorrectionLevel: QrErrorCorrectLevel.H,
+              semanticsLabel: '全屏学校入场二维码');
+          })))))));
+  }
+
   @override
   Widget build(BuildContext context) => Padding(
       padding: const EdgeInsets.symmetric(vertical: 16),
@@ -36,13 +50,14 @@ class _EntryPassViewState extends State<EntryPassView> {
           Text('入场二维码', style: Theme.of(context).textTheme.titleMedium),
           for (final pass in passes) ...[
             Text('${pass['date']} ${pass['range']} · ${pass['area_name']}'),
-            LayoutBuilder(builder: (context, constraints) => QrImageView(
+            Semantics(button: true, label: '点击全屏查看入场二维码', child: InkWell(
+              onTap: () => enlarge(pass), child: LayoutBuilder(builder: (context, constraints) => QrImageView(
               data: '${pass['payload']}', version: QrVersions.auto,
               size: constraints.maxWidth.clamp(0, 280), padding: const EdgeInsets.all(48),
               backgroundColor: Colors.white, errorCorrectionLevel: QrErrorCorrectLevel.H,
-              semanticsLabel: '学校入场二维码')),
+              semanticsLabel: '学校入场二维码')))),
           ],
-          const Text('到场后出示此码扫码入场'),
+          const Text('点击二维码可全屏查看，到场后出示此码扫码入场'),
         ]);
       }));
 }

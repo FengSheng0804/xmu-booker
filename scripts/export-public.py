@@ -14,7 +14,8 @@ ALLOWED = ['README.md', 'LICENSE', '.gitignore', '.gitattributes', '.github/work
            'apps/mobile/android/app/capture-proguard-rules.pro', 'apps/mobile/android/settings.gradle.kts',
            'apps/mobile/android/build.gradle.kts', 'apps/mobile/android/gradle.properties',
            'apps/mobile/android/gradle', 'apps/mobile/android/gradlew', 'apps/mobile/android/gradlew.bat',
-           'apps/mobile/production.json', 'scripts/build-mobile.ps1', 'scripts/export-public.py', 'docs/public']
+           'apps/mobile/production.json', 'scripts/build-mobile.ps1', 'scripts/export-public.py',
+           'scripts/prepare-release-signing.py', 'scripts/tests/test_release_signing.py', 'docs/public']
 DENIED = ['BEGIN PRIVATE KEY', 'BEGIN RSA PRIVATE KEY',
           'C:\\Users\\', 'F:\\desktop\\', 'root@', 'API_BASE_URL', 'api_base_url',
           'admin_token', 'postgresql+asyncpg']

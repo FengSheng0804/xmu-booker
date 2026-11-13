@@ -116,6 +116,12 @@ public abstract class LocalDatabase extends RoomDatabase {
     @Query("SELECT * FROM tasks WHERE state='PENDING' ORDER BY prepareAt LIMIT 1")
     Task next();
 
+    @Query("SELECT * FROM tasks WHERE state IN ('PENDING','CLAIMED','SENT') ORDER BY prepareAt LIMIT 1")
+    Task recoveryNext();
+
+    @Query("SELECT * FROM tasks WHERE state IN ('PENDING','CLAIMED')")
+    List<Task> activeUnsent();
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long addTask(Task task);
 
@@ -147,15 +153,24 @@ public abstract class LocalDatabase extends RoomDatabase {
             + " state='CLAIMED' AND receipt=:claim")
     int markSent(String id, String receipt, long now, String claim);
 
+    @Query("UPDATE tasks SET state='PENDING', prepareAt=:nextAt, receipt=:receipt, reason=:reason, updatedAt=:now"
+        + " WHERE id=:id AND state='CLAIMED' AND receipt=:claim")
+    int deferMonitor(String id, String claim, long nextAt, String receipt, String reason, long now);
+
     @Query(
         "UPDATE tasks SET state='CANCELLED', reason='计划已停用', updatedAt=:now WHERE planId=:planId"
             + " AND state IN ('PENDING','CLAIMED')")
     void cancelPending(String planId, long now);
 
-    @Query(
-        "UPDATE tasks SET state='UNKNOWN', reason='执行曾中断，必须先查单', updatedAt=:now WHERE state IN"
-            + " ('CLAIMED','SENT')")
-    void recover(long now);
+    @Query("UPDATE tasks SET state=CASE WHEN deadline>:now THEN 'PENDING' ELSE 'EXPIRED' END,"
+        + " reason='未提交任务已恢复，等待执行', updatedAt=:now WHERE state='CLAIMED'")
+    void recoverUnsent(long now);
+
+    @Query("UPDATE tasks SET state='UNKNOWN', reason='提交曾中断，必须先查单', updatedAt=:now WHERE state='SENT'")
+    void recoverSent(long now);
+
+    @Transaction
+    default void recover(long now) { recoverUnsent(now); recoverSent(now); }
 
     @Query("SELECT * FROM cache WHERE `key`=:key")
     Cache cached(String key);

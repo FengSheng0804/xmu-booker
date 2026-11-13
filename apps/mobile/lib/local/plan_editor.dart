@@ -35,6 +35,9 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
       venues.where((v) => venueCampus(v) == campus).toList();
   late DateTime date;
   String repeat = 'ONCE';
+  String executionMode = 'TIMED';
+  int pollSeconds = 30;
+  late int monitorStartAt, monitorEndAt;
   bool confirmed = false, busy = false;
   String? error;
   String? slotMessage;
@@ -56,6 +59,10 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
   void initState() {
     super.initState();
     final p = widget.plan;
+    executionMode = '${p?['execution_mode'] ?? 'TIMED'}';
+    pollSeconds = (p?['poll_seconds'] as num?)?.toInt() ?? 30;
+    monitorStartAt = (p?['monitor_start_at'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch;
+    monitorEndAt = (p?['monitor_end_at'] as num?)?.toInt() ?? monitorStartAt + 3600000;
     venue = p?['venue'] as Json? ?? widget.initialVenue ?? widget.venues.first;
     venues = [...widget.venues];
     final current = venues.where((v) => venueKey(v) == venueKey(venue));
@@ -141,6 +148,25 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
   }
 
   String get day => date.toIso8601String().substring(0, 10);
+  bool get isFutureDate => date.isAfter(beijingToday());
+  bool get monitoring => executionMode == 'MONITOR';
+
+  Future<void> pickMonitorTime(bool start) async {
+    final millis = start ? monitorStartAt : monitorEndAt;
+    final wall = DateTime.fromMillisecondsSinceEpoch(millis, isUtc: true).add(const Duration(hours: 8));
+    final today = beijingToday();
+    final last = date.isBefore(today) ? today : date;
+    var initial = DateTime(wall.year, wall.month, wall.day);
+    if (initial.isBefore(today)) initial = today;
+    if (initial.isAfter(last)) initial = last;
+    final day = await showDatePicker(context: context, firstDate: today, lastDate: last, initialDate: initial);
+    if (day == null || !mounted) return;
+    final time = await showTimePicker(context: context, initialTime: TimeOfDay(hour: wall.hour, minute: wall.minute));
+    if (time == null || !mounted) return;
+    final value = DateTime.utc(day.year, day.month, day.day, time.hour, time.minute)
+        .subtract(const Duration(hours: 8)).millisecondsSinceEpoch;
+    setState(() { if (start) { monitorStartAt = value; } else { monitorEndAt = value; } });
+  }
   bool timeValid(String? value) =>
       RegExp(r'^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$').hasMatch(value ?? '');
   Widget text(String label, TextEditingController controller,
@@ -184,7 +210,8 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
             final oldKey = venueKey(venue);
             final updated = {...venue, ...resolved};
             if (oldKey != venueKey(updated)) confirmed = false;
-            venues.removeWhere((v) => venueKey(v) == oldKey || venueKey(v) == venueKey(updated));
+            venues.removeWhere((v) =>
+                venueKey(v) == oldKey || venueKey(v) == venueKey(updated));
             venue = updated;
             venues.add(venue);
           }
@@ -229,8 +256,14 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
       setState(() => error = '请至少填写一个入场日的候选时段');
       return;
     }
+    if (monitoring && (monitorEndAt <= monitorStartAt || monitorEndAt <= DateTime.now().millisecondsSinceEpoch ||
+        monitorEndAt - monitorStartAt > 72 * 3600000 || monitorEndAt >
+          DateTime.utc(date.year, date.month, date.day + 1).subtract(const Duration(hours: 8)).millisecondsSinceEpoch)) {
+      setState(() => error = '监控截止须晚于开始和当前时间，最长72小时，且不超过入场日期');
+      return;
+    }
     if (!confirmed) {
-      setState(() => error = '启用前请确认学校放号规则');
+      setState(() => error = monitoring ? '请确认发现空位后自动预约' : '启用前请确认学校放号规则');
       return;
     }
     setState(() {
@@ -253,13 +286,17 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
         'name': name.text.trim(),
         'venue': cleanVenue,
         'repeat': repeat,
+        'execution_mode': executionMode,
+        if (monitoring) ...{
+          'monitor_start_at': monitorStartAt, 'monitor_end_at': monitorEndAt, 'poll_seconds': pollSeconds,
+        },
         'date': day,
         'weekdays': weekly,
-        'release_time': release.text,
-        'execution_time': execute.text,
-        'days_before': int.parse(daysBefore.text),
-        'window_seconds': int.parse(window.text),
-        'prepare_lead_seconds': int.parse(lead.text),
+        'release_time': monitoring ? '00:00:00' : release.text,
+        'execution_time': monitoring ? '00:00:00' : execute.text,
+        'days_before': monitoring ? 0 : int.parse(daysBefore.text),
+        'window_seconds': monitoring ? 120 : int.parse(window.text),
+        'prepare_lead_seconds': monitoring ? 0 : int.parse(lead.text),
         'priority': int.parse(priority.text),
         'rule_confirmed': confirmed,
         'enabled': true,
@@ -280,8 +317,16 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
       body: Form(
           key: form,
           child: ListView(padding: const EdgeInsets.all(20), children: [
-            const Text('计划只保存在这台手机。学校放号规则须自行核对；新建计划默认暂停。'),
+            const Text('计划保存在这台手机，保存后自动启用，可在计划菜单暂停。'),
             text('计划名称', name),
+            Padding(padding: const EdgeInsets.symmetric(vertical: 8), child: DropdownButtonFormField<String>(
+              key: const ValueKey('execution-mode'), initialValue: executionMode,
+              decoration: const InputDecoration(labelText: '执行方式'), items: const [
+                DropdownMenuItem(value: 'TIMED', child: Text('定时执行')),
+                DropdownMenuItem(value: 'MONITOR', child: Text('监控余量')),
+              ], onChanged: busy ? null : (value) => setState(() {
+                executionMode = value!; if (monitoring) repeat = 'ONCE'; confirmed = false;
+              }))),
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 8),
               child: DropdownButtonFormField<String>(
@@ -320,7 +365,7 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                                 .firstWhere((item) => venueKey(item) == v));
                           })),
             ),
-            Padding(
+            if (!monitoring) Padding(
               padding: const EdgeInsets.symmetric(vertical: 8),
               child: DropdownButtonFormField<String>(
                   initialValue: repeat,
@@ -400,11 +445,13 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                 ),
               ),
             if (slots.isNotEmpty) ...[
-              const Padding(
-                padding: EdgeInsets.only(top: 8, bottom: 4),
+              Padding(
+                padding: const EdgeInsets.only(top: 8, bottom: 4),
                 child: Text(
-                  '学校返回时段（点击左侧时段选择/取消，右侧按键增减优先级）：',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                  monitoring ? '选择要监控的时段，可选择已约满或尚未开放的时段。发现空位后会按候选优先级尝试预约。' : isFutureDate
+                      ? '未来时段可提前选择为计划候选；未开放或已约满不影响预设。到执行时间会重新检查学校开放状态与余量，不保证预约成功。'
+                      : '学校返回时段（点击左侧时段选择/取消，右侧按键增减优先级）：',
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
                 ),
               ),
               Column(
@@ -417,6 +464,7 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                   return SlotOption(
                     range: r,
                     availability: SlotAvailability.from(s),
+                    allowPlanning: isFutureDate || monitoring,
                     priority: priorityNum,
                     busy: busy,
                     onToggle: () => toggleSlot(r),
@@ -451,6 +499,7 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                   return null;
                 }),
             const SizedBox(height: 16),
+            if (!monitoring) ...[
             const Text('放号与执行规则',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const Text('默认07:00与提前1天来自历史配置，不代表学校当前规则。修改场馆或规则后请重新确认。'),
@@ -475,6 +524,19 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                         int.parse(s) <= 120
                     ? null
                     : '填写0至120'),
+            ] else ...[
+              const Text('监控设置', style: TextStyle(fontWeight: FontWeight.bold)),
+              const Text('监控期间持续在后台检查，耗电和网络使用会增加。当前满员时继续等待；成功、截止或暂停后结束。所有时间均为北京时间，最长72小时。'),
+              Padding(padding: const EdgeInsets.symmetric(vertical:4), child: OutlinedButton.icon(key: const ValueKey('monitor-start'), onPressed: busy ? null : () => pickMonitorTime(true),
+                icon: const Icon(Icons.schedule), label: Text('监控开始：${beijingMillis(monitorStartAt).replaceAll(' 北京时间','')}'))),
+              Padding(padding: const EdgeInsets.symmetric(vertical:4), child: OutlinedButton.icon(key: const ValueKey('monitor-end'), onPressed: busy ? null : () => pickMonitorTime(false),
+                icon: const Icon(Icons.event_busy), label: Text('监控截止：${beijingMillis(monitorEndAt).replaceAll(' 北京时间','')}'))),
+              DropdownButtonFormField<int>(key: const ValueKey('monitor-interval'), initialValue: pollSeconds,
+                decoration: const InputDecoration(labelText: '检查间隔'),
+                items: [10, 30, 60, 120, 300, if (![10,30,60,120,300].contains(pollSeconds)) pollSeconds]
+                  .map((s) => DropdownMenuItem(value: s, child: Text('每 $s 秒'))).toList(),
+                onChanged: busy ? null : (value) => setState(() => pollSeconds = value!)),
+            ],
             text('执行优先级（1最高）', priority,
                 validate: (s) => int.tryParse(s ?? '') != null &&
                         int.parse(s!) >= 1 &&
@@ -485,7 +547,7 @@ class _LocalPlanEditorState extends State<LocalPlanEditor> {
                 contentPadding: EdgeInsets.zero,
                 value: confirmed,
                 onChanged: busy ? null : (v) => setState(() => confirmed = v!),
-                title: const Text('我已核对学校当前放号规则')),
+                title: Text(monitoring ? '我确认发现空位后自动预约' : '我已核对学校当前放号规则')),
             const Text('保存后自动启用本机计划，可在计划菜单中暂停。'),
             if (error != null)
               Text(error!,

@@ -51,12 +51,17 @@ class SlotOption extends StatelessWidget {
       required this.priority,
       required this.busy,
       required this.onToggle,
+      this.allowPlanning = false,
       this.onEarlier,
       this.onLater});
   final String range;
   final SlotAvailability availability;
   final int? priority;
   final bool busy;
+
+  /// Future plan candidates need not be bookable at edit time. This never changes
+  /// the school's availability flags or permits an immediate booking.
+  final bool allowPlanning;
   final VoidCallback onToggle;
   final VoidCallback? onEarlier, onLater;
 
@@ -64,14 +69,18 @@ class SlotOption extends StatelessWidget {
   Widget build(BuildContext context) {
     final selected = priority != null;
     final available = availability.available;
-    final foreground = !available
-        ? Colors.grey.shade700
-        : selected
-            ? Colors.white
-            : const Color(0xFF142F48);
+    final plannable = allowPlanning && !available;
+    final selectable = available || allowPlanning;
+    final foreground = selected
+        ? Colors.white
+        : selectable
+            ? const Color(0xFF142F48)
+            : Colors.grey.shade700;
     final label = available
         ? '$range (已预约/总量: ${availability.booked}/${availability.total})'
-        : '$range（不可预约：${availability.reason}）';
+        : plannable
+            ? '$range（可预设，当前${availability.reason}）'
+            : '$range（不可预约：${availability.reason}）';
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Material(
@@ -89,16 +98,16 @@ class SlotOption extends StatelessWidget {
                 child: Semantics(
               selected: selected,
               button: true,
-              enabled: !busy && (available || selected),
+              enabled: !busy && (selectable || selected),
               child: Material(
                 key: ValueKey('slot-button-$range'),
-                color: !available
-                    ? Colors.grey.shade200
-                    : selected
-                        ? Colors.green.shade600
-                        : Colors.white,
+                color: selected
+                    ? Colors.green.shade600
+                    : selectable
+                        ? Colors.white
+                        : Colors.grey.shade200,
                 child: InkWell(
-                  onTap: busy || (!available && !selected) ? null : onToggle,
+                  onTap: busy || (!selectable && !selected) ? null : onToggle,
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(minHeight: 48),
                     child: Padding(

@@ -60,8 +60,10 @@ void main() {
       if (call.method == 'home') return jsonEncode(home);
       if (call.method == 'savePlan') return 'saved-id';
       if (call.method == 'availability') {
-        return jsonEncode({'time_slot_list': [],
-          if (resolvedVenue != null) 'resolved_target': resolvedVenue});
+        return jsonEncode({
+          'time_slot_list': [],
+          if (resolvedVenue != null) 'resolved_target': resolvedVenue
+        });
       }
       return null;
     });
@@ -127,7 +129,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.scrollUntilVisible(
         find.byKey(const ValueKey('home-campus-翔安校区')), 250);
-    await tester.drag(find.byType(Scrollable).first, const Offset(0, -200));
+      await Scrollable.ensureVisible(tester.element(find.byKey(const ValueKey('home-campus-翔安校区'))), alignment: 0.5);
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('home-campus-翔安校区')));
     await tester.pumpAndSettle();
@@ -155,13 +157,22 @@ void main() {
     expect(planStatus({'repeat': 'WEEKLY', 'enabled': true}), '已启用');
   });
 
-  test('read authorization failures explain recovery and preserve task history', () {
+  test('read authorization failures explain recovery and preserve task history',
+      () {
     const detail = '学校授权校验未通过（步骤：建立体育会话，状态：0）：学校未提供详细原因。请更新授权';
-    expect(localError(PlatformException(code: 'READ_CHECK_LOGIN_REJECTED', message: detail)), detail);
-    expect(localError(PlatformException(code: 'READ_CHECK_REJECTED')), contains('更新学校授权'));
-    expect(localError(PlatformException(code: 'READ_CHECK_REJECTED')), contains('待核对记录会保留'));
-    expect(localError(PlatformException(code: 'READ_CHECK_HTTP_FAILED')), contains('网络'));
-    expect(localError(PlatformException(code: 'READ_CHECK_LOGIN_REJECTED', message: 'untrusted-response')),
+    expect(
+        localError(PlatformException(
+            code: 'READ_CHECK_LOGIN_REJECTED', message: detail)),
+        detail);
+    expect(localError(PlatformException(code: 'READ_CHECK_REJECTED')),
+        contains('更新学校授权'));
+    expect(localError(PlatformException(code: 'READ_CHECK_REJECTED')),
+        contains('待核对记录会保留'));
+    expect(localError(PlatformException(code: 'READ_CHECK_HTTP_FAILED')),
+        contains('网络'));
+    expect(
+        localError(PlatformException(
+            code: 'READ_CHECK_LOGIN_REJECTED', message: 'untrusted-response')),
         isNot(contains('untrusted-response')));
   });
 
@@ -330,7 +341,11 @@ void main() {
     await tester.tap(find.text('新建本机计划'));
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextFormField, '计划名称'), '本地计划');
-    resolvedVenue = {...venuesList.first, 'venue_id': '114', 'project_name': '学校正式项目'};
+    resolvedVenue = {
+      ...venuesList.first,
+      'venue_id': '114',
+      'project_name': '学校正式项目'
+    };
     await tester.ensureVisible(find.text('查询学校时段与余量'));
     await tester.tap(find.text('查询学校时段与余量'));
     await tester.pumpAndSettle();
@@ -452,6 +467,80 @@ void main() {
     await tester.pumpAndSettle();
     options = tester.widgetList<SlotOption>(find.byType(SlotOption)).toList();
     expect(options.every((o) => !o.availability.available), isTrue);
+    expect(options.every((o) => o.allowPlanning), isTrue);
+    await tester
+        .ensureVisible(find.byKey(const ValueKey('slot-button-09:00-10:00')));
+    await tester.tap(find.byKey(const ValueKey('slot-button-09:00-10:00')));
+    await tester.pumpAndSettle();
+    options = tester.widgetList<SlotOption>(find.byType(SlotOption)).toList();
+    expect(options.first.priority, 1);
+    // Planning must not rewrite a school-closed slot as currently available.
+    expect(options.first.availability.available, isFalse);
+    expect(tester.takeException(), isNull);
+  });
+  testWidgets('future closed school slots save as ordered plan candidates',
+      (tester) async {
+    final tomorrow = beijingToday().add(const Duration(days: 1));
+    final day = tomorrow.toIso8601String().substring(0, 10);
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(LocalApi.channel, (call) async {
+      calls.add(call);
+      if (call.method == 'savePlan') return 'saved-id';
+      if (call.method != 'availability') return null;
+      return jsonEncode({
+        'is_can_choose': 0,
+        'is_can_choose_tips': '未开放预约',
+        'personal_num': 10,
+        'time_slot_list': [
+          for (final range in ['09:00-10:00', '10:00-11:00'])
+            {
+              'date': day,
+              'time_range': range,
+              'slots': [
+                {'date': day, 'status': 'locked', 'selected': 0}
+              ]
+            }
+        ]
+      });
+    });
+    await tester
+        .pumpWidget(MaterialApp(home: LocalPlanEditor(venues: venuesList)));
+    await tester.pumpAndSettle();
+    final nameField = find.widgetWithText(TextFormField, '计划名称');
+    await tester.enterText(nameField, '明天提前预约');
+    await tester.scrollUntilVisible(find.text('查询学校时段与余量'), 250,
+        scrollable: find.descendant(of: find.byType(ListView), matching: find.byType(Scrollable)).first);
+    await tester.tap(find.text('查询学校时段与余量'));
+    await tester.pumpAndSettle();
+    for (final range in ['09:00-10:00', '10:00-11:00']) {
+      final button = find.byKey(ValueKey('slot-button-$range'));
+      await tester.scrollUntilVisible(button, 180,
+          scrollable: find.descendant(of: find.byType(ListView), matching: find.byType(Scrollable)).first);
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+    }
+    await Scrollable.ensureVisible(
+        tester.element(find.byIcon(Icons.add).first),
+        alignment: 0.5);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.add).first);
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+        find.text('我已核对学校当前放号规则'), 300,
+        scrollable: find.descendant(
+            of: find.byType(ListView), matching: find.byType(Scrollable)).first);
+    await tester.tap(find.text('我已核对学校当前放号规则'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('保存到本机'));
+    await tester.tap(find.text('保存到本机'));
+    await tester.pumpAndSettle();
+    final saved = calls.singleWhere((c) => c.method == 'savePlan');
+    final plan = jsonDecode((saved.arguments as Map)['plan'] as String);
+    expect(plan['date'], day);
+    expect(plan['weekdays']['${tomorrow.weekday}'],
+        ['10:00-11:00', '09:00-10:00']);
+    expect(plan['enabled'], isTrue);
+    expect(calls.where((c) => c.method == 'runTask'), isEmpty);
     expect(tester.takeException(), isNull);
   });
   testWidgets(

@@ -108,6 +108,42 @@ void main() {
     }
   }
 
+  for (final reason in ['未开放预约', '已约满']) {
+    testWidgets('future candidate can be selected and deselected: $reason',
+        (tester) async {
+      var selected = false;
+      var busy = false;
+      late StateSetter update;
+      await tester.pumpWidget(MaterialApp(
+          home: Scaffold(body: StatefulBuilder(builder: (context, setState) {
+        update = setState;
+        return SlotOption(
+            range: '09:00-10:00',
+            availability: SlotAvailability(0, 10, reason),
+            allowPlanning: true,
+            priority: selected ? 1 : null,
+            busy: busy,
+            onToggle: () => setState(() => selected = !selected));
+      }))));
+      final button = find.byKey(const ValueKey('slot-button-09:00-10:00'));
+      expect(find.text('09:00-10:00（可预设，当前$reason）'), findsOneWidget);
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      expect(selected, isTrue);
+      expect(tester.widget<Material>(button).color, Colors.green.shade600);
+      expect(find.text('优先级 1'), findsOneWidget);
+      update(() => busy = true);
+      await tester.pump();
+      await tester.tap(button);
+      expect(selected, isTrue);
+      update(() => busy = false);
+      await tester.pump();
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      expect(selected, isFalse);
+    });
+  }
+
   testWidgets('unavailable slot is grey, explains why, and cannot be selected',
       (tester) async {
     var taps = 0;

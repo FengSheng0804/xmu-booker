@@ -51,6 +51,8 @@ String localError(Object error) {
   }
   return const {
         'EXECUTION_WINDOW_INVALID': '执行窗口须为15至3600秒，从计划执行时间开始计算',
+        'MONITOR_WINDOW_INVALID': '监控起止时间须有效，截止晚于当前时间，最长72小时且不超过入场日期',
+        'MONITOR_INTERVAL_INVALID': '监控检查间隔须为10至600秒',
         'AUTH_REQUIRED': '请先在本机获取或更新学校授权',
         'ENTRY_PASS_UNAVAILABLE': '学校当前未提供可用入场二维码，请核对订单是否有效或已核销',
         'READ_CHECK_REJECTED': '学校未接受已保存的授权，请在微信重新进入体育预约页面，再到本机设置更新学校授权后查单；待核对记录会保留',
@@ -88,7 +90,9 @@ bool singlePlanEnded(Json plan) {
 String planStatus(Json plan) => singlePlanEnded(plan)
     ? '已结束（${stateText((plan['last_result'] as Map)['state'])}）'
     : plan['enabled'] == true
-        ? '已启用'
+        ? plan['execution_mode'] == 'MONITOR'
+          ? ((plan['monitor_start_at'] as num?) ?? 0) <= DateTime.now().millisecondsSinceEpoch ? '监控中' : '等待监控'
+          : '已启用'
         : '已暂停';
 
 String executionReason(Object? reason) => reason == '预约未完成：SCHOOL_REJECTED'
@@ -96,6 +100,10 @@ String executionReason(Object? reason) => reason == '预约未完成：SCHOOL_RE
     : '$reason'.contains('PENDING_RECONCILIATION')
         ? '预约未执行：同场馆同日有旧任务待核对，请打开详情处理旧任务阻塞'
         : '${reason ?? ''}';
+
+String taskStateText(Json task) => task['target']?['execution_mode'] == 'MONITOR' && task['state'] == 'PENDING'
+    ? ((task['run_at'] as num?) ?? 0) <= DateTime.now().millisecondsSinceEpoch ? '监控中' : '等待监控'
+    : stateText(task['state']);
 
 String stateText(Object? state) =>
     const {

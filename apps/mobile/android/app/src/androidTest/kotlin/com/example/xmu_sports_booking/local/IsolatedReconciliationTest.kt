@@ -42,6 +42,7 @@ class IsolatedReconciliationTest {
         val rows = JSONArray()
         var reads = 0
         var failRead = false
+        var readException: Exception? = null
         var afterRead: (() -> Unit)? = null
         override fun call(route: String, values: MutableMap<String, String>, cookie: String,
             referer: String, image: Boolean): SchoolSession.Reply {
@@ -50,6 +51,7 @@ class IsolatedReconciliationTest {
                 JSONObject().put("status", 1)).also { it.session = "synthetic-session" }
             check(route == "/index/stadium/mySubscribe") { "WRITE_OR_UNEXPECTED_ROUTE_REFUSED" }
             reads++
+            readException?.let { throw it }
             if (failRead) error("SIMULATED_READ_FAILURE")
             afterRead?.invoke()
             return SchoolSession.Reply(JSONObject().put("status", 1).put("data", rows))
@@ -258,5 +260,44 @@ class IsolatedReconciliationTest {
         val id = engine.savePlan(plan)
         assertTrue(db.store().plan(id).enabled)
         assertTrue(engine.enabled)
+    }
+
+    private fun executableTask(): String {
+        db.store().clearTasks()
+        val plan = db.store().plan("plan")
+        plan.enabled = true; db.store().savePlan(plan)
+        val id = "synthetic-execution-failure"
+        db.store().addTask(LocalDatabase.Task().apply {
+            this.id = id; planId = "plan"; date = "2026-11-13"; target = target().toString()
+            runAt = System.currentTimeMillis() - 1; deadline = System.currentTimeMillis() + 120000
+        })
+        return id
+    }
+
+    @Test fun preSubmissionTimeoutRecordsItsReadStageWithoutAnySubmit() {
+        val id = executableTask()
+        wire.readException = java.net.SocketTimeoutException("private request must not persist")
+        engine.execute(id)
+        val task = db.store().task(id)
+        assertEquals("FAILED", task.state)
+        assertTrue(task.reason.contains("读取本人订单：网络请求超时"))
+        val receipt = JSONObject(task.receipt)
+        assertEquals("READ_BASELINE_ORDERS", receipt.getJSONObject("failure").getString("phase"))
+        assertEquals("NETWORK_TIMEOUT", receipt.getJSONObject("failure").getString("code"))
+        assertTrue(receipt.has("claim")); assertFalse(receipt.has("detail"))
+        assertFalse(task.receipt.contains("private request"))
+        assertEquals(1, wire.reads)
+    }
+
+    @Test fun malformedSchoolDataRecordsItsTypeWithoutPersistingTheResponse() {
+        val id = executableTask()
+        wire.readException = org.json.JSONException("token=synthetic-secret")
+        engine.execute(id)
+        val task = db.store().task(id)
+        assertEquals("FAILED", task.state)
+        assertTrue(task.reason.contains("学校返回的数据格式异常"))
+        assertEquals("org.json.JSONException", JSONObject(task.receipt).getJSONObject("failure").getString("exception_type"))
+        assertFalse(task.receipt.contains("synthetic-secret"))
+        assertEquals(1, wire.reads)
     }
 }

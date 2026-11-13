@@ -8,6 +8,9 @@
 *.jks
 *.p12
 *.keystore
+**/key.properties
+**/signing.properties
+**/keystore.properties
 *.pem
 *.db
 *.sqlite*

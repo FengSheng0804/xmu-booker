@@ -42,9 +42,12 @@ class LocalBridge(private val activity: FlutterActivity, private val channel: Me
                                 )
                         "battery" ->
                             activity.startActivity(
-                                Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                    Uri.parse("package:${activity.packageName}"))
                             )
                     }
+                    if (call.argument<String>("kind") == "app") activity.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${activity.packageName}")))
                     result.success(null)
                 }
                 else ->
